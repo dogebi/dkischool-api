@@ -281,7 +281,10 @@ async fn proxy_site_image(
         || !ALLOWED_HOSTS.contains(&url.host_str().unwrap_or_default())
         || !url.username().is_empty()
         || url.password().is_some()
-        || url.port().is_some()
+        || (url.port().is_some()
+            && !(url.scheme() == "https"
+                && url.host_str() == Some("withschool.co.kr")
+                && url.port() == Some(3187)))
     {
         return message(StatusCode::FORBIDDEN, "Image host is not allowed");
     }
