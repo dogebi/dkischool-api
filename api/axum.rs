@@ -60,6 +60,18 @@ struct NoticeInput {
     published: bool,
 }
 
+#[derive(Deserialize)]
+struct SiteImport {
+    pages: Vec<serde_json::Value>,
+    articles: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct SitePageQuery {
+    page: Option<i64>,
+    per_page: Option<i64>,
+}
+
 #[derive(Serialize)]
 struct Message {
     message: String,
@@ -163,6 +175,13 @@ async fn initialize_db(db: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("CREATE TABLE IF NOT EXISTS notices (id TEXT PRIMARY KEY, created_at BIGINT NOT NULL, payload JSONB NOT NULL)").execute(db).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at BIGINT NOT NULL)").execute(db).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS login_attempts (ip TEXT NOT NULL, attempted_at BIGINT NOT NULL)").execute(db).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS site_pages (menu_no TEXT PRIMARY KEY, title TEXT NOT NULL, payload JSONB NOT NULL)").execute(db).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS site_articles (menu_no TEXT NOT NULL, bno TEXT NOT NULL, sort_order BIGINT NOT NULL, payload JSONB NOT NULL, PRIMARY KEY (menu_no, bno))").execute(db).await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS site_articles_order_idx ON site_articles (menu_no, sort_order)",
+    )
+    .execute(db)
+    .await?;
     sqlx::query("DELETE FROM admin_sessions WHERE expires_at <= $1")
         .bind(now_seconds())
         .execute(db)
@@ -212,6 +231,124 @@ async fn initialize_db(db: &PgPool) -> Result<(), sqlx::Error> {
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok", "service":"dkischool-api"}))
+}
+
+async fn site_page(State(state): State<AppState>, Path(menu_no): Path<String>) -> Response {
+    match sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload FROM site_pages WHERE menu_no = $1",
+    )
+    .bind(menu_no)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(payload)) => Json(payload).into_response(),
+        Ok(None) => message(StatusCode::NOT_FOUND, "Page not found"),
+        Err(_) => message(StatusCode::INTERNAL_SERVER_ERROR, "Content lookup failed"),
+    }
+}
+
+async fn site_board(
+    State(state): State<AppState>,
+    Path(menu_no): Path<String>,
+    Query(query): Query<SitePageQuery>,
+) -> Response {
+    let page = query.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = query.per_page.unwrap_or(12).clamp(1, 100);
+    let offset = (page - 1) * per_page;
+    let rows = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT jsonb_build_object('menu_no', payload->'menu_no', 'bno', payload->'bno', 'title', payload->'title', 'metadata_text', payload->'metadata_text', 'images', payload->'images') FROM site_articles WHERE menu_no = $1 ORDER BY sort_order ASC LIMIT $2 OFFSET $3",
+    )
+    .bind(&menu_no)
+    .bind(per_page)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await;
+    let total =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM site_articles WHERE menu_no = $1")
+            .bind(&menu_no)
+            .fetch_one(&state.db)
+            .await;
+    match (rows, total) {
+        (Ok(items), Ok(total)) => Json(
+            serde_json::json!({"items": items, "page": page, "per_page": per_page, "total": total}),
+        )
+        .into_response(),
+        _ => message(StatusCode::INTERNAL_SERVER_ERROR, "Content lookup failed"),
+    }
+}
+
+async fn site_article(
+    State(state): State<AppState>,
+    Path((menu_no, bno)): Path<(String, String)>,
+) -> Response {
+    match sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload FROM site_articles WHERE menu_no = $1 AND bno = $2",
+    )
+    .bind(menu_no)
+    .bind(bno)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(payload)) => Json(payload).into_response(),
+        Ok(None) => message(StatusCode::NOT_FOUND, "Article not found"),
+        Err(_) => message(StatusCode::INTERNAL_SERVER_ERROR, "Content lookup failed"),
+    }
+}
+
+async fn import_site(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<SiteImport>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state).await {
+        return response;
+    }
+    if input.pages.len() + input.articles.len() > 20 {
+        return message(
+            StatusCode::BAD_REQUEST,
+            "Import batches are limited to 20 records",
+        );
+    }
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return message(StatusCode::INTERNAL_SERVER_ERROR, "Import could not start"),
+    };
+    for page in &input.pages {
+        let Some(menu_no) = page.get("menu_no").and_then(serde_json::Value::as_str) else {
+            return message(StatusCode::BAD_REQUEST, "Page menu_no is required");
+        };
+        let Some(title) = page.get("title").and_then(serde_json::Value::as_str) else {
+            return message(StatusCode::BAD_REQUEST, "Page title is required");
+        };
+        if sqlx::query("INSERT INTO site_pages (menu_no, title, payload) VALUES ($1, $2, $3) ON CONFLICT (menu_no) DO UPDATE SET title = EXCLUDED.title, payload = EXCLUDED.payload")
+            .bind(menu_no).bind(title).bind(page).execute(&mut *tx).await.is_err() {
+            return message(StatusCode::INTERNAL_SERVER_ERROR, "Page import failed");
+        }
+    }
+    for article in &input.articles {
+        let (Some(menu_no), Some(bno)) = (
+            article.get("menu_no").and_then(serde_json::Value::as_str),
+            article.get("bno").and_then(serde_json::Value::as_str),
+        ) else {
+            return message(
+                StatusCode::BAD_REQUEST,
+                "Article menu_no and bno are required",
+            );
+        };
+        let sort_order = article
+            .get("sort_order")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0);
+        if sqlx::query("INSERT INTO site_articles (menu_no, bno, sort_order, payload) VALUES ($1, $2, $3, $4) ON CONFLICT (menu_no, bno) DO UPDATE SET sort_order = EXCLUDED.sort_order, payload = EXCLUDED.payload")
+            .bind(menu_no).bind(bno).bind(sort_order).bind(article).execute(&mut *tx).await.is_err() {
+            return message(StatusCode::INTERNAL_SERVER_ERROR, "Article import failed");
+        }
+    }
+    if tx.commit().await.is_err() {
+        return message(StatusCode::INTERNAL_SERVER_ERROR, "Import could not finish");
+    }
+    Json(serde_json::json!({"pages": input.pages.len(), "articles": input.articles.len()}))
+        .into_response()
 }
 
 async fn login(
@@ -531,6 +668,10 @@ async fn app() -> Result<Router, Error> {
     };
     let mut router = Router::new()
         .route("/api/health", get(health))
+        .route("/api/site/pages/{menu_no}", get(site_page))
+        .route("/api/site/boards/{menu_no}", get(site_board))
+        .route("/api/site/articles/{menu_no}/{bno}", get(site_article))
+        .route("/api/admin/site-import", post(import_site))
         .route("/api/notices", get(list_notices))
         .route("/api/notices/{id}", get(get_notice))
         .route("/api/admin/login", post(login))
@@ -541,7 +682,7 @@ async fn app() -> Result<Router, Error> {
             "/api/admin/notices/{id}",
             put(update_notice).delete(delete_notice),
         )
-        .layer(RequestBodyLimitLayer::new(128 * 1024))
+        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
         .with_state(state);
     if let Ok(origin) = env::var("FRONTEND_ORIGIN") {
         let origin = origin.parse::<HeaderValue>()?;
