@@ -2,6 +2,7 @@
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
@@ -15,7 +16,7 @@ use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{
     collections::HashMap,
     env,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceBuilder;
 use tower_http::{cors::CorsLayer, limit::RequestBodyLimitLayer};
@@ -29,6 +30,7 @@ const SESSION_SECONDS: i64 = 8 * 60 * 60;
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
+    http_client: reqwest::Client,
     username: Option<String>,
     password_hash: Option<String>,
     secure_cookie: bool,
@@ -245,6 +247,91 @@ async fn site_page(State(state): State<AppState>, Path(menu_no): Path<String>) -
         Ok(None) => message(StatusCode::NOT_FOUND, "Page not found"),
         Err(_) => message(StatusCode::INTERNAL_SERVER_ERROR, "Content lookup failed"),
     }
+}
+
+async fn proxy_site_image(
+    State(state): State<AppState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    const ALLOWED_HOSTS: [&str; 16] = [
+        "dkischool.org",
+        "www.dkischool.org",
+        "dkischool.withschool.co.kr",
+        "www.withschool.co.kr",
+        "withschool.co.kr",
+        "dkis.withschool.co.kr",
+        "news.einfomax.co.kr",
+        "www.womennews.co.kr",
+        "cjimage.joins.com",
+        "www.inews24.com",
+        "www.topik.go.kr",
+        "ggg.hs.kr",
+        "postfiles4.naver.net",
+        "cfile8.uf.tistory.com",
+        "i1.daumcdn.net",
+        "img.morningreading.org",
+    ];
+    let Some(raw_url) = query.get("url") else {
+        return message(StatusCode::BAD_REQUEST, "Image URL is required");
+    };
+    let Ok(url) = reqwest::Url::parse(raw_url) else {
+        return message(StatusCode::BAD_REQUEST, "Invalid image URL");
+    };
+    if !["http", "https"].contains(&url.scheme())
+        || !ALLOWED_HOSTS.contains(&url.host_str().unwrap_or_default())
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return message(StatusCode::FORBIDDEN, "Image host is not allowed");
+    }
+    let upstream = match state.http_client.get(url).send().await {
+        Ok(response) if response.status().is_success() => response,
+        _ => return message(StatusCode::BAD_GATEWAY, "Source image could not be fetched"),
+    };
+    let content_type = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    if !content_type.to_ascii_lowercase().starts_with("image/") {
+        return message(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Source did not return an image",
+        );
+    }
+    if upstream
+        .content_length()
+        .is_some_and(|length| length > 20 * 1024 * 1024)
+    {
+        return message(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Source image exceeds the cacheable size",
+        );
+    }
+    let content_length = upstream.content_length();
+    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, s-maxage=31536000, stale-while-revalidate=86400"),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Some(length) = content_length {
+        if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
+            response.headers_mut().insert(header::CONTENT_LENGTH, value);
+        }
+    }
+    response
 }
 
 async fn site_board(
@@ -651,6 +738,9 @@ async fn app() -> Result<Router, Error> {
     }
     let state = AppState {
         db,
+        http_client: reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()?,
         username: env::var("ADMIN_USERNAME").ok().filter(|v| !v.is_empty()),
         password_hash: env::var("ADMIN_PASSWORD")
             .ok()
@@ -669,6 +759,7 @@ async fn app() -> Result<Router, Error> {
     let mut router = Router::new()
         .route("/api/health", get(health))
         .route("/api/site/pages/{menu_no}", get(site_page))
+        .route("/api/site/image", get(proxy_site_image))
         .route("/api/site/boards/{menu_no}", get(site_board))
         .route("/api/site/articles/{menu_no}/{bno}", get(site_article))
         .route("/api/admin/site-import", post(import_site))
