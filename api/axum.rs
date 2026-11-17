@@ -592,11 +592,28 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
             score,
         });
     }
-    if contact_intent {
-        for item in &mut matches {
-            if item.url == "#/page/20" {
-                item.score += 30;
-            }
+    if contact_intent && !matches.iter().any(|item| item.url == "#/page/20") {
+        if let Ok(Some(payload)) = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT payload FROM site_pages WHERE menu_no = '20'",
+        )
+        .fetch_optional(&state.db)
+        .await
+        {
+            let title = payload
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("오시는 길");
+            let body = payload
+                .get("body_html")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            matches.push(ChatMatch {
+                title: title.to_owned(),
+                excerpt: excerpt(body, &terms),
+                url: "#/page/20".to_owned(),
+                kind: "page",
+                score: 30,
+            });
         }
     }
     matches.sort_by(|left, right| right.score.cmp(&left.score));
