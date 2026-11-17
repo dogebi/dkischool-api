@@ -445,7 +445,7 @@ async fn matching_content(
     table: &'static str,
     terms: &[String],
 ) -> Result<Vec<serde_json::Value>, sqlx::Error> {
-    let mut query = QueryBuilder::<Postgres>::new(format!("SELECT payload FROM {table} WHERE "));
+    let mut query = QueryBuilder::<Postgres>::new(format!("SELECT payload FROM {table} WHERE ("));
     for (index, term) in terms.iter().enumerate() {
         if index > 0 {
             query.push(" OR ");
@@ -454,6 +454,10 @@ async fn matching_content(
             .push("payload::text ILIKE ")
             .push_bind(format!("%{term}%"));
     }
+    query.push(")");
+    if table == "site_pages" {
+        query.push(" AND COALESCE(payload->>'access_status', '') <> 'restricted'");
+    }
     query.push(" ORDER BY (");
     for (index, term) in terms.iter().enumerate() {
         if index > 0 {
@@ -461,6 +465,8 @@ async fn matching_content(
         }
         query
             .push("CASE WHEN payload->>'title' ILIKE ")
+            .push_bind(format!("%{term}%"))
+            .push(" THEN 10 ELSE 0 END + CASE WHEN payload->>'body_html' ILIKE ")
             .push_bind(format!("%{term}%"))
             .push(" THEN 1 ELSE 0 END");
     }
