@@ -485,13 +485,16 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
             "질문은 2자 이상 300자 이하로 입력해 주세요.",
         );
     }
-    let terms = query_text
+    let mut terms = query_text
         .split_whitespace()
         .map(|term| term.trim_matches(|character: char| !character.is_alphanumeric()))
         .filter(|term| term.chars().count() >= 2)
         .take(8)
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    if terms.len() > 1 && terms.iter().any(|term| !matches!(term.as_str(), "학교" | "안내" | "문의" | "정보")) {
+        terms.retain(|term| !matches!(term.as_str(), "학교" | "안내" | "문의" | "정보"));
+    }
     if terms.is_empty() {
         return Json(serde_json::json!({"matches": []})).into_response();
     }
