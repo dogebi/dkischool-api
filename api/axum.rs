@@ -298,8 +298,8 @@ async fn proxy_site_image(
         || url.password().is_some()
         || (url.port().is_some()
             && !(url.scheme() == "https"
-                && url.host_str() == Some("withschool.co.kr")
-                && url.port() == Some(3187)))
+                && ((url.host_str() == Some("withschool.co.kr") && url.port() == Some(3187))
+                    || (url.host_str() == Some("ggg.hs.kr") && url.port() == Some(535)))))
     {
         return message(StatusCode::FORBIDDEN, "Image host is not allowed");
     }
