@@ -509,10 +509,15 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
         let Some(menu_no) = payload.get("menu_no").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        let title = payload
+        let raw_title = payload
             .get("title")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("학교 안내");
+        let title = if raw_title.chars().any(char::is_alphanumeric) {
+            raw_title
+        } else {
+            "학교 홈페이지"
+        };
         let body = payload
             .get("body_html")
             .and_then(serde_json::Value::as_str)
