@@ -12,7 +12,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{PgPool, Postgres, QueryBuilder, postgres::PgPoolOptions};
 use std::{
     collections::HashMap,
     env,
@@ -72,6 +72,21 @@ struct SiteImport {
 struct SitePageQuery {
     page: Option<i64>,
     per_page: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ChatRequest {
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ChatMatch {
+    title: String,
+    excerpt: String,
+    url: String,
+    kind: &'static str,
+    #[serde(skip)]
+    score: usize,
 }
 
 #[derive(Serialize)]
@@ -383,6 +398,179 @@ async fn site_article(
         Ok(None) => message(StatusCode::NOT_FOUND, "Article not found"),
         Err(_) => message(StatusCode::INTERNAL_SERVER_ERROR, "Content lookup failed"),
     }
+}
+
+fn html_text(value: &str) -> String {
+    let mut text = String::with_capacity(value.len());
+    let mut in_tag = false;
+    for character in value.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(character),
+            _ => {}
+        }
+    }
+    text.replace("&nbsp;", " ")
+        .replace("&#160;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn excerpt(value: &str, terms: &[String]) -> String {
+    let text = html_text(value);
+    let offset = terms
+        .iter()
+        .filter_map(|term| text.to_lowercase().find(&term.to_lowercase()))
+        .min()
+        .map(|byte_offset| text[..byte_offset].chars().count().saturating_sub(80))
+        .unwrap_or(0);
+    let chars = text.chars().collect::<Vec<_>>();
+    let end = (offset + 320).min(chars.len());
+    let excerpt = chars[offset..end].iter().collect::<String>();
+    format!(
+        "{}{}{}",
+        if offset > 0 { "…" } else { "" },
+        excerpt,
+        if end < chars.len() { "…" } else { "" }
+    )
+}
+
+async fn matching_content(
+    db: &PgPool,
+    table: &'static str,
+    terms: &[String],
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let mut query = QueryBuilder::<Postgres>::new(format!("SELECT payload FROM {table} WHERE "));
+    for (index, term) in terms.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query
+            .push("payload::text ILIKE ")
+            .push_bind(format!("%{term}%"));
+    }
+    query.push(" ORDER BY (");
+    for (index, term) in terms.iter().enumerate() {
+        if index > 0 {
+            query.push(" + ");
+        }
+        query
+            .push("CASE WHEN payload->>'title' ILIKE ")
+            .push_bind(format!("%{term}%"))
+            .push(" THEN 1 ELSE 0 END");
+    }
+    query
+        .push(") DESC LIMIT 8")
+        .build_query_scalar::<serde_json::Value>()
+        .fetch_all(db)
+        .await
+}
+
+async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>) -> Response {
+    let query_text = input.message.trim();
+    if query_text.chars().count() < 2 || query_text.chars().count() > 300 {
+        return message(
+            StatusCode::BAD_REQUEST,
+            "질문은 2자 이상 300자 이하로 입력해 주세요.",
+        );
+    }
+    let terms = query_text
+        .split_whitespace()
+        .map(|term| term.trim_matches(|character: char| !character.is_alphanumeric()))
+        .filter(|term| term.chars().count() >= 2)
+        .take(8)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return Json(serde_json::json!({"matches": []})).into_response();
+    }
+    let pages = matching_content(&state.db, "site_pages", &terms).await;
+    let articles = matching_content(&state.db, "site_articles", &terms).await;
+    let (Ok(pages), Ok(articles)) = (pages, articles) else {
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "학교 자료 검색에 실패했습니다.",
+        );
+    };
+    let mut matches = Vec::new();
+    for payload in pages {
+        if payload
+            .get("access_status")
+            .and_then(serde_json::Value::as_str)
+            == Some("restricted")
+        {
+            continue;
+        }
+        let Some(menu_no) = payload.get("menu_no").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let title = payload
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("학교 안내");
+        let body = payload
+            .get("body_html")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let excerpt = excerpt(body, &terms);
+        let title_lower = title.to_lowercase();
+        let body_lower = body.to_lowercase();
+        let score = terms
+            .iter()
+            .map(|term| {
+                usize::from(title_lower.contains(&term.to_lowercase())) * 10
+                    + usize::from(body_lower.contains(&term.to_lowercase()))
+            })
+            .sum();
+        matches.push(ChatMatch {
+            title: title.to_owned(),
+            excerpt,
+            url: format!("#/page/{menu_no}"),
+            kind: "page",
+            score,
+        });
+    }
+    for payload in articles {
+        let (Some(menu_no), Some(bno)) = (
+            payload.get("menu_no").and_then(serde_json::Value::as_str),
+            payload.get("bno").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let title = payload
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("게시물");
+        let body = payload
+            .get("body_html")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let excerpt = excerpt(body, &terms);
+        let title_lower = title.to_lowercase();
+        let body_lower = body.to_lowercase();
+        let score = terms
+            .iter()
+            .map(|term| {
+                usize::from(title_lower.contains(&term.to_lowercase())) * 10
+                    + usize::from(body_lower.contains(&term.to_lowercase()))
+            })
+            .sum();
+        matches.push(ChatMatch {
+            title: title.to_owned(),
+            excerpt,
+            url: format!("#/page/{menu_no}?menu_no={menu_no}&bno={bno}&board_mode=view"),
+            kind: "article",
+            score,
+        });
+    }
+    matches.sort_by(|left, right| right.score.cmp(&left.score));
+    matches.truncate(8);
+    Json(serde_json::json!({"matches": matches})).into_response()
 }
 
 async fn import_site(
@@ -765,6 +953,7 @@ async fn app() -> Result<Router, Error> {
         .route("/api/site/image", get(proxy_site_image))
         .route("/api/site/boards/{menu_no}", get(site_board))
         .route("/api/site/articles/{menu_no}/{bno}", get(site_article))
+        .route("/api/site/chat", post(site_chat))
         .route("/api/admin/site-import", post(import_site))
         .route("/api/notices", get(list_notices))
         .route("/api/notices/{id}", get(get_notice))
