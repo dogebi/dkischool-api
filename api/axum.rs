@@ -492,8 +492,18 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
         .take(8)
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let contact_intent = ["연락처", "전화번호", "전화", "주소", "오시는길", "위치"]
+        .iter()
+        .any(|term| query_text.replace(' ', "").contains(term));
     if terms.len() > 1 && terms.iter().any(|term| !matches!(term.as_str(), "학교" | "안내" | "문의" | "정보")) {
         terms.retain(|term| !matches!(term.as_str(), "학교" | "안내" | "문의" | "정보"));
+    }
+    if contact_intent {
+        for term in ["연락처", "전화번호", "전화", "주소", "오시는길"] {
+            if !terms.iter().any(|existing| existing == term) {
+                terms.push(term.to_owned());
+            }
+        }
     }
     if terms.is_empty() {
         return Json(serde_json::json!({"matches": []})).into_response();
@@ -581,6 +591,13 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
             kind: "article",
             score,
         });
+    }
+    if contact_intent {
+        for item in &mut matches {
+            if item.url == "#/page/20" {
+                item.score += 30;
+            }
+        }
     }
     matches.sort_by(|left, right| right.score.cmp(&left.score));
     matches.truncate(8);
