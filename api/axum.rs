@@ -718,6 +718,43 @@ fn chat_topic(question: &str) -> Option<&'static str> {
     .map(|(topic, _)| topic)
 }
 
+async fn admin_chat_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state).await {
+        return response;
+    }
+    let days = match query.get("days").map(String::as_str).unwrap_or("30") {
+        "7" => 7,
+        "30" => 30,
+        "90" => 90,
+        "all" => 0,
+        _ => return message(StatusCode::BAD_REQUEST, "조회 기간을 다시 선택해 주세요."),
+    };
+    let rows = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT day::text, topic, searches FROM chat_topic_daily WHERE $1 = 0 OR day >= CURRENT_DATE - ($1 - 1) ORDER BY day DESC, topic",
+    )
+    .bind(days)
+    .fetch_all(&state.db)
+    .await;
+    let Ok(rows) = rows else {
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "채팅 통계를 불러오지 못했습니다.",
+        );
+    };
+    let daily: Vec<_> = rows.into_iter().map(|(date, topic, searches)| {
+        serde_json::json!({"date": date, "topic": topic, "searches": searches})
+    }).collect();
+    (
+        [(header::CACHE_CONTROL, "private, no-store")],
+        Json(serde_json::json!({"daily": daily})),
+    )
+        .into_response()
+}
+
 async fn popular_chat_topics(State(state): State<AppState>) -> Response {
     match sqlx::query_scalar::<_, String>(
         "SELECT topic FROM chat_topic_daily WHERE day >= CURRENT_DATE - 29 GROUP BY topic ORDER BY SUM(searches) DESC, topic LIMIT 5"
@@ -1717,6 +1754,7 @@ async fn app() -> Result<Router, Error> {
         .route("/api/site/articles/{menu_no}/{bno}", get(site_article))
         .route("/api/site/chat", post(site_chat))
         .route("/api/site/chat/popular", get(popular_chat_topics))
+        .route("/api/admin/chat/stats", get(admin_chat_stats))
         .route("/api/site/chat/feedback", post(chat_feedback))
         .route("/api/admin/site-import", post(import_site))
         .route("/api/notices", get(list_notices))
