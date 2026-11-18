@@ -733,8 +733,8 @@ async fn admin_chat_stats(
         "all" => 0,
         _ => return message(StatusCode::BAD_REQUEST, "조회 기간을 다시 선택해 주세요."),
     };
-    let rows = sqlx::query_as::<_, (String, String, i64)>(
-        "SELECT day::text, topic, searches FROM chat_topic_daily WHERE $1 = 0 OR day >= CURRENT_DATE - ($1 - 1) ORDER BY day DESC, topic",
+    let rows = sqlx::query_as::<_, (String, String, i64, i64, i64)>(
+        "SELECT day::text, topic, searches, measured_searches, no_results FROM chat_topic_daily WHERE $1 = 0 OR day >= CURRENT_DATE - ($1 - 1) ORDER BY day DESC, topic",
     )
     .bind(days)
     .fetch_all(&state.db)
@@ -745,12 +745,30 @@ async fn admin_chat_stats(
             "채팅 통계를 불러오지 못했습니다.",
         );
     };
-    let daily: Vec<_> = rows.into_iter().map(|(date, topic, searches)| {
-        serde_json::json!({"date": date, "topic": topic, "searches": searches})
+    let daily: Vec<_> = rows.into_iter().map(|(date, topic, searches, measured, no_results)| {
+        serde_json::json!({"date": date, "topic": topic, "searches": searches, "measured": measured, "no_results": no_results})
     }).collect();
+    let likes = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT votes.result_url, COALESCE(a.payload->>'title', p.payload->>'title', votes.result_url), votes.total
+         FROM (SELECT result_url, COUNT(*) AS total FROM chat_likes GROUP BY result_url) votes
+         LEFT JOIN site_articles a ON votes.result_url = '#/page/' || a.menu_no || '?menu_no=' || a.menu_no || '&bno=' || a.bno || '&board_mode=view'
+         LEFT JOIN site_pages p ON votes.result_url = '#/page/' || p.menu_no
+         WHERE a.menu_no IS NOT NULL OR p.menu_no IS NOT NULL
+         ORDER BY votes.total DESC, votes.result_url LIMIT 10",
+    ).fetch_all(&state.db).await;
+    let Ok(likes) = likes else {
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "도움됐어요 통계를 불러오지 못했습니다.",
+        );
+    };
+    let helpful: Vec<_> = likes
+        .into_iter()
+        .map(|(url, title, count)| serde_json::json!({"url": url, "title": title, "count": count}))
+        .collect();
     (
         [(header::CACHE_CONTROL, "private, no-store")],
-        Json(serde_json::json!({"daily": daily})),
+        Json(serde_json::json!({"daily": daily, "helpful": helpful})),
     )
         .into_response()
 }
@@ -941,8 +959,8 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
         }
     }
     if let Some(topic) = chat_topic(query_text) {
-        let _ = sqlx::query("INSERT INTO chat_topic_daily (topic, day) VALUES ($1, CURRENT_DATE) ON CONFLICT (topic, day) DO UPDATE SET searches = chat_topic_daily.searches + 1")
-            .bind(topic).execute(&state.db).await;
+        let _ = sqlx::query("INSERT INTO chat_topic_daily (topic, day, measured_searches, no_results) VALUES ($1, CURRENT_DATE, 1, $2) ON CONFLICT (topic, day) DO UPDATE SET searches = chat_topic_daily.searches + 1, measured_searches = chat_topic_daily.measured_searches + 1, no_results = chat_topic_daily.no_results + EXCLUDED.no_results")
+            .bind(topic).bind(i64::from(matches.is_empty())).execute(&state.db).await;
     }
     let visitor = input.visitor.filter(|id| Uuid::parse_str(id).is_ok());
     let urls: Vec<_> = matches.iter().map(|item| item.url.clone()).collect();
