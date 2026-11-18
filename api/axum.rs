@@ -3,7 +3,7 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -30,6 +30,7 @@ use vercel_runtime::axum::VercelLayer;
 const SESSION_COOKIE: &str = "dkis_admin";
 const SESSION_SECONDS: i64 = 8 * 60 * 60;
 const MAX_SOURCE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_ATTACHMENT_BYTES: usize = 3 * 1024 * 1024;
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 const ALLOWED_IMAGE_HOSTS: [&str; 16] = [
     "dkischool.org",
@@ -68,11 +69,22 @@ struct Notice {
     menu_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image_url: Option<String>,
+    #[serde(default)]
+    attachments: Vec<NoticeAttachment>,
     title: String,
     body: String,
     published: bool,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NoticeAttachment {
+    id: String,
+    filename: String,
+    content_type: String,
+    size_bytes: usize,
+    url: String,
 }
 
 #[derive(Deserialize)]
@@ -261,6 +273,68 @@ fn decode_notice_image(value: &str) -> Result<(String, Vec<u8>), String> {
     Ok((content_type.into(), bytes))
 }
 
+fn validate_attachment(filename: &str, bytes: &[u8]) -> Result<&'static str, String> {
+    if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err("Attachments must be smaller than 3 MB.".into());
+    }
+    let extension = filename
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .ok_or("This file type is not supported.")?;
+    let valid = match extension.as_str() {
+        "jpg" | "jpeg" if bytes.starts_with(&[0xff, 0xd8, 0xff]) => "image/jpeg",
+        "png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => "image/png",
+        "webp" if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") => "image/webp",
+        "gif" if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") => "image/gif",
+        "pdf" if bytes.starts_with(b"%PDF-") => "application/pdf",
+        "hwp" if bytes.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") => "application/x-hwp",
+        "hwpx" | "docx" | "xlsx" | "pptx" if bytes.starts_with(b"PK\x03\x04") => {
+            match extension.as_str() {
+                "hwpx" => "application/vnd.hancom.hwpx",
+                "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                _ => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            }
+        }
+        "doc" if bytes.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") => "application/msword",
+        "xls" if bytes.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") => {
+            "application/vnd.ms-excel"
+        }
+        "ppt" if bytes.starts_with(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") => {
+            "application/vnd.ms-powerpoint"
+        }
+        "txt" if std::str::from_utf8(bytes).is_ok() && !bytes.contains(&0) => {
+            "text/plain; charset=utf-8"
+        }
+        _ => return Err("File type does not match its contents or is not supported.".into()),
+    };
+    Ok(valid)
+}
+
+fn safe_attachment_filename(value: &str) -> Option<String> {
+    let filename = value.rsplit(['/', '\\']).next()?.trim();
+    if filename.is_empty()
+        || filename.chars().count() > 180
+        || filename.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(filename.to_owned())
+}
+
+fn encode_header_filename(filename: &str) -> String {
+    filename
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&byte) {
+                (byte as char).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+
 async fn initialize_db(db: &PgPool) -> Result<(), Error> {
     MIGRATOR.run(db).await?;
     sqlx::query("DELETE FROM admin_sessions WHERE expires_at <= $1")
@@ -298,6 +372,7 @@ async fn initialize_db(db: &PgPool) -> Result<(), Error> {
                 category: category.into(),
                 menu_id: None,
                 image_url: None,
+                attachments: Vec::new(),
                 title: title.into(),
                 body: body.into(),
                 published: true,
@@ -990,12 +1065,259 @@ async fn notice_image(State(state): State<AppState>, Path(id): Path<String>) -> 
                 header::CACHE_CONTROL,
                 HeaderValue::from_static("public, max-age=3600"),
             );
+            response.headers_mut().insert(
+                "x-content-type-options",
+                HeaderValue::from_static("nosniff"),
+            );
             response
         }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => message(
             StatusCode::INTERNAL_SERVER_ERROR,
             "이미지를 불러오지 못했습니다.",
+        ),
+    }
+}
+
+async fn notice_attachment(
+    State(state): State<AppState>,
+    Path((notice_id, attachment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let record = sqlx::query_as::<_, (serde_json::Value, String, String, Vec<u8>)>(
+        "SELECT n.payload, a.filename, a.content_type, a.data FROM notices n JOIN notice_attachments a ON a.notice_id = n.id WHERE n.id = $1 AND a.id = $2",
+    )
+    .bind(notice_id)
+    .bind(attachment_id)
+    .fetch_optional(&state.db)
+    .await;
+    match record {
+        Ok(Some((payload, filename, content_type, bytes))) => {
+            let published = payload
+                .get("published")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true);
+            if !published && session_user(&headers, &state).await.is_none() {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            let mut response = Body::from(bytes).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(&content_type)
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+            );
+            let disposition = format!(
+                "attachment; filename=attachment; filename*=UTF-8''{}",
+                encode_header_filename(&filename)
+            );
+            if let Ok(value) = HeaderValue::from_str(&disposition) {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_DISPOSITION, value);
+            }
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(if published {
+                    "public, max-age=3600"
+                } else {
+                    "private, no-store"
+                }),
+            );
+            response.headers_mut().insert(
+                "x-content-type-options",
+                HeaderValue::from_static("nosniff"),
+            );
+            response
+        }
+        Ok(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Attachment could not be loaded.",
+        ),
+    }
+}
+
+async fn upload_notice_attachment(
+    State(state): State<AppState>,
+    Path(notice_id): Path<String>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state).await {
+        return response;
+    }
+    let field = match multipart.next_field().await {
+        Ok(Some(field)) if field.name() == Some("file") => field,
+        _ => return message(StatusCode::BAD_REQUEST, "A file field is required."),
+    };
+    let Some(filename) = field.file_name().and_then(safe_attachment_filename) else {
+        return message(StatusCode::BAD_REQUEST, "Attachment filename is invalid.");
+    };
+    let bytes = match field.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => return message(StatusCode::BAD_REQUEST, "Attachment could not be read."),
+    };
+    match multipart.next_field().await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return message(
+                StatusCode::BAD_REQUEST,
+                "Upload one attachment per request.",
+            );
+        }
+        Err(_) => return message(StatusCode::BAD_REQUEST, "Attachment request is invalid."),
+    }
+    let content_type = match validate_attachment(&filename, &bytes) {
+        Ok(content_type) => content_type,
+        Err(error) => return message(StatusCode::BAD_REQUEST, error),
+    };
+    let payload = match sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload FROM notices WHERE id = $1",
+    )
+    .bind(&notice_id)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(payload)) => payload,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Notice could not be loaded.",
+            );
+        }
+    };
+    let mut notice = match serde_json::from_value::<Notice>(payload) {
+        Ok(notice) => notice,
+        Err(_) => return message(StatusCode::INTERNAL_SERVER_ERROR, "Notice data is invalid."),
+    };
+    if notice.attachments.len() >= 20 {
+        return message(
+            StatusCode::BAD_REQUEST,
+            "A notice can have at most 20 attachments.",
+        );
+    }
+    let attachment_id = Uuid::new_v4().to_string();
+    let sort_order = notice.attachments.len() as i32;
+    let attachment = NoticeAttachment {
+        id: attachment_id.clone(),
+        filename,
+        content_type: content_type.to_owned(),
+        size_bytes: bytes.len(),
+        url: format!("/notices/{notice_id}/attachments/{attachment_id}"),
+    };
+    notice.attachments.push(attachment.clone());
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Attachment could not be saved.",
+            );
+        }
+    };
+    if sqlx::query("INSERT INTO notice_attachments (id, notice_id, filename, content_type, size_bytes, sort_order, data) VALUES ($1, $2, $3, $4, $5, $6, $7)")
+        .bind(&attachment.id)
+        .bind(&notice_id)
+        .bind(&attachment.filename)
+        .bind(&attachment.content_type)
+        .bind(attachment.size_bytes as i64)
+        .bind(sort_order)
+        .bind(bytes.as_ref())
+        .execute(&mut *tx)
+        .await
+        .is_err()
+    {
+        return message(StatusCode::INTERNAL_SERVER_ERROR, "Attachment could not be saved.");
+    }
+    if sqlx::query("UPDATE notices SET payload = $2 WHERE id = $1")
+        .bind(&notice_id)
+        .bind(serde_json::to_value(&notice).unwrap_or_default())
+        .execute(&mut *tx)
+        .await
+        .is_err()
+    {
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Attachment metadata could not be saved.",
+        );
+    }
+    if tx.commit().await.is_err() {
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Attachment could not be saved.",
+        );
+    }
+    (StatusCode::CREATED, Json(attachment)).into_response()
+}
+
+async fn delete_notice_attachment(
+    State(state): State<AppState>,
+    Path((notice_id, attachment_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state).await {
+        return response;
+    }
+    let payload = match sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload FROM notices WHERE id = $1",
+    )
+    .bind(&notice_id)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(payload)) => payload,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Notice could not be loaded.",
+            );
+        }
+    };
+    let mut notice = match serde_json::from_value::<Notice>(payload) {
+        Ok(notice) => notice,
+        Err(_) => return message(StatusCode::INTERNAL_SERVER_ERROR, "Notice data is invalid."),
+    };
+    let before = notice.attachments.len();
+    notice
+        .attachments
+        .retain(|attachment| attachment.id != attachment_id);
+    if before == notice.attachments.len() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Attachment could not be removed.",
+            );
+        }
+    };
+    if sqlx::query("DELETE FROM notice_attachments WHERE id = $1 AND notice_id = $2")
+        .bind(&attachment_id)
+        .bind(&notice_id)
+        .execute(&mut *tx)
+        .await
+        .is_err()
+        || sqlx::query("UPDATE notices SET payload = $2 WHERE id = $1")
+            .bind(&notice_id)
+            .bind(serde_json::to_value(&notice).unwrap_or_default())
+            .execute(&mut *tx)
+            .await
+            .is_err()
+    {
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Attachment could not be removed.",
+        );
+    }
+    match tx.commit().await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Attachment could not be removed.",
         ),
     }
 }
@@ -1040,6 +1362,7 @@ async fn create_notice(
         category: input.category.trim().into(),
         menu_id: input.menu_id,
         image_url: image.as_ref().map(|_| format!("/notices/{id}/image")),
+        attachments: Vec::new(),
         title: input.title.trim().into(),
         body: input.body.trim().into(),
         published: input.published,
@@ -1147,6 +1470,7 @@ async fn update_notice(
         category: input.category.trim().into(),
         menu_id: input.menu_id,
         image_url,
+        attachments: old.attachments,
         title: input.title.trim().into(),
         body: input.body.trim().into(),
         published: input.published,
@@ -1273,6 +1597,10 @@ async fn app() -> Result<Router, Error> {
         .route("/api/notices", get(list_notices))
         .route("/api/notices/{id}", get(get_notice))
         .route("/api/notices/{id}/image", get(notice_image))
+        .route(
+            "/api/notices/{id}/attachments/{attachment_id}",
+            get(notice_attachment),
+        )
         .route("/api/admin/login", post(login))
         .route("/api/admin/logout", post(logout))
         .route("/api/admin/session", get(admin_session))
@@ -1281,7 +1609,15 @@ async fn app() -> Result<Router, Error> {
             "/api/admin/notices/{id}",
             put(update_notice).delete(delete_notice),
         )
-        .layer(RequestBodyLimitLayer::new(2 * 1024 * 1024))
+        .route(
+            "/api/admin/notices/{id}/attachments",
+            post(upload_notice_attachment),
+        )
+        .route(
+            "/api/admin/notices/{id}/attachments/{attachment_id}",
+            axum::routing::delete(delete_notice_attachment),
+        )
+        .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024))
         .with_state(state);
     if let Ok(origin) = env::var("FRONTEND_ORIGIN") {
         let origin = origin.parse::<HeaderValue>()?;
@@ -1307,8 +1643,8 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NoticeInput, STANDARD, allowed_source_image_url, decode_notice_image,
-        normalized_search_terms, validate_notice,
+        MAX_ATTACHMENT_BYTES, NoticeInput, STANDARD, allowed_source_image_url, decode_notice_image,
+        normalized_search_terms, safe_attachment_filename, validate_attachment, validate_notice,
     };
     use base64::Engine;
 
@@ -1368,5 +1704,25 @@ mod tests {
         assert!(terms.iter().any(|term| term == "어디에서"));
         assert!(terms.iter().any(|term| term == "어디"));
         assert!(terms.len() <= 8);
+    }
+
+    #[test]
+    fn attachments_require_allowed_extensions_and_matching_signatures() {
+        assert_eq!(
+            validate_attachment("안내.pdf", b"%PDF-1.7"),
+            Ok("application/pdf")
+        );
+        assert_eq!(
+            validate_attachment("안내.txt", "학교 안내".as_bytes()),
+            Ok("text/plain; charset=utf-8")
+        );
+        assert!(validate_attachment("payload.exe", b"MZ").is_err());
+        assert!(validate_attachment("fake.pdf", b"not a PDF").is_err());
+        assert!(validate_attachment("large.txt", &vec![b'a'; MAX_ATTACHMENT_BYTES + 1]).is_err());
+        assert_eq!(
+            safe_attachment_filename("..\\안내.pdf").as_deref(),
+            Some("안내.pdf")
+        );
+        assert!(safe_attachment_filename("bad\nname.pdf").is_none());
     }
 }
