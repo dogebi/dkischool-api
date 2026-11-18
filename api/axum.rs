@@ -29,6 +29,25 @@ use vercel_runtime::axum::VercelLayer;
 
 const SESSION_COOKIE: &str = "dkis_admin";
 const SESSION_SECONDS: i64 = 8 * 60 * 60;
+const MAX_SOURCE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const ALLOWED_IMAGE_HOSTS: [&str; 16] = [
+    "dkischool.org",
+    "www.dkischool.org",
+    "dkischool.withschool.co.kr",
+    "www.withschool.co.kr",
+    "withschool.co.kr",
+    "dkis.withschool.co.kr",
+    "news.einfomax.co.kr",
+    "www.womennews.co.kr",
+    "cjimage.joins.com",
+    "www.inews24.com",
+    "www.topik.go.kr",
+    "ggg.hs.kr",
+    "postfiles4.naver.net",
+    "cfile8.uf.tistory.com",
+    "i1.daumcdn.net",
+    "img.morningreading.org",
+];
 
 #[derive(Clone)]
 struct AppState {
@@ -320,43 +339,28 @@ async fn site_page(State(state): State<AppState>, Path(menu_no): Path<String>) -
     }
 }
 
+fn allowed_source_image_url(url: &reqwest::Url) -> bool {
+    ["http", "https"].contains(&url.scheme())
+        && ALLOWED_IMAGE_HOSTS.contains(&url.host_str().unwrap_or_default())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && (url.port().is_none()
+            || (url.scheme() == "https"
+                && ((url.host_str() == Some("withschool.co.kr") && url.port() == Some(3187))
+                    || (url.host_str() == Some("ggg.hs.kr") && url.port() == Some(535)))))
+}
+
 async fn proxy_site_image(
     State(state): State<AppState>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    const ALLOWED_HOSTS: [&str; 16] = [
-        "dkischool.org",
-        "www.dkischool.org",
-        "dkischool.withschool.co.kr",
-        "www.withschool.co.kr",
-        "withschool.co.kr",
-        "dkis.withschool.co.kr",
-        "news.einfomax.co.kr",
-        "www.womennews.co.kr",
-        "cjimage.joins.com",
-        "www.inews24.com",
-        "www.topik.go.kr",
-        "ggg.hs.kr",
-        "postfiles4.naver.net",
-        "cfile8.uf.tistory.com",
-        "i1.daumcdn.net",
-        "img.morningreading.org",
-    ];
     let Some(raw_url) = query.get("url") else {
         return message(StatusCode::BAD_REQUEST, "Image URL is required");
     };
     let Ok(url) = reqwest::Url::parse(raw_url) else {
         return message(StatusCode::BAD_REQUEST, "Invalid image URL");
     };
-    if !["http", "https"].contains(&url.scheme())
-        || !ALLOWED_HOSTS.contains(&url.host_str().unwrap_or_default())
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || (url.port().is_some()
-            && !(url.scheme() == "https"
-                && ((url.host_str() == Some("withschool.co.kr") && url.port() == Some(3187))
-                    || (url.host_str() == Some("ggg.hs.kr") && url.port() == Some(535)))))
-    {
+    if !allowed_source_image_url(&url) {
         return message(StatusCode::FORBIDDEN, "Image host is not allowed");
     }
     let upstream = match state.http_client.get(url).send().await {
@@ -377,15 +381,39 @@ async fn proxy_site_image(
     }
     if upstream
         .content_length()
-        .is_some_and(|length| length > 20 * 1024 * 1024)
+        .is_some_and(|length| length > MAX_SOURCE_IMAGE_BYTES as u64)
     {
         return message(
             StatusCode::PAYLOAD_TOO_LARGE,
             "Source image exceeds the cacheable size",
         );
     }
-    let content_length = upstream.content_length();
-    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    let mut bytes = Vec::with_capacity(
+        upstream
+            .content_length()
+            .unwrap_or_default()
+            .min(MAX_SOURCE_IMAGE_BYTES as u64) as usize,
+    );
+    let mut upstream = upstream;
+    loop {
+        match upstream.chunk().await {
+            Ok(Some(chunk))
+                if bytes.len().saturating_add(chunk.len()) <= MAX_SOURCE_IMAGE_BYTES =>
+            {
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(Some(_)) => {
+                return message(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "Source image exceeds the cacheable size",
+                );
+            }
+            Ok(None) => break,
+            Err(_) => return message(StatusCode::BAD_GATEWAY, "Source image could not be fetched"),
+        }
+    }
+    let content_length = bytes.len();
+    let mut response = Response::new(Body::from(bytes));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -400,10 +428,8 @@ async fn proxy_site_image(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    if let Some(length) = content_length {
-        if let Ok(value) = HeaderValue::from_str(&length.to_string()) {
-            response.headers_mut().insert(header::CONTENT_LENGTH, value);
-        }
+    if let Ok(value) = HeaderValue::from_str(&content_length.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, value);
     }
     response
 }
@@ -1179,6 +1205,13 @@ async fn app() -> Result<Router, Error> {
         db,
         http_client: reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 || !allowed_source_image_url(attempt.url()) {
+                    attempt.stop()
+                } else {
+                    attempt.follow()
+                }
+            }))
             .build()?,
         username: env::var("ADMIN_USERNAME").ok().filter(|v| !v.is_empty()),
         password_hash: env::var("ADMIN_PASSWORD")
@@ -1239,7 +1272,9 @@ async fn main() -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NoticeInput, STANDARD, decode_notice_image, validate_notice};
+    use super::{
+        NoticeInput, STANDARD, allowed_source_image_url, decode_notice_image, validate_notice,
+    };
     use base64::Engine;
 
     fn valid_notice(menu_id: Option<&str>) -> NoticeInput {
@@ -1269,5 +1304,24 @@ mod tests {
         assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
         assert!(decode_notice_image("data:image/svg+xml;base64,PHN2Zz4=").is_err());
         assert!(decode_notice_image("data:image/png;base64,dGVzdA==").is_err());
+    }
+
+    #[test]
+    fn image_proxy_allows_only_listed_hosts_and_ports() {
+        assert!(allowed_source_image_url(
+            &reqwest::Url::parse("https://dkischool.org/image.jpg").unwrap()
+        ));
+        assert!(allowed_source_image_url(
+            &reqwest::Url::parse("https://withschool.co.kr:3187/image.jpg").unwrap()
+        ));
+        assert!(!allowed_source_image_url(
+            &reqwest::Url::parse("https://example.com/image.jpg").unwrap()
+        ));
+        assert!(!allowed_source_image_url(
+            &reqwest::Url::parse("http://dkischool.org:8080/image.jpg").unwrap()
+        ));
+        assert!(!allowed_source_image_url(
+            &reqwest::Url::parse("https://user@dkischool.org/image.jpg").unwrap()
+        ));
     }
 }
