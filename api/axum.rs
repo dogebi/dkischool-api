@@ -8,7 +8,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -41,6 +44,10 @@ struct AppState {
 struct Notice {
     id: String,
     category: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    menu_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_url: Option<String>,
     title: String,
     body: String,
     published: bool,
@@ -57,6 +64,12 @@ struct LoginRequest {
 #[derive(Deserialize)]
 struct NoticeInput {
     category: String,
+    #[serde(default)]
+    menu_id: Option<String>,
+    #[serde(default)]
+    image_data: Option<String>,
+    #[serde(default)]
+    remove_image: bool,
     title: String,
     body: String,
     published: bool,
@@ -175,21 +188,62 @@ fn clear_session_cookie(response: &mut Response, state: &AppState) {
 }
 
 fn validate_notice(input: &NoticeInput) -> Result<(), String> {
-    if !["공지사항", "가정통신문", "학교소식", "학교앨범"].contains(&input.category.trim())
+    let valid_menu_ids = [
+        "40", "41", "42", "44", "45", "46", "47", "49", "70", "79", "81", "87", "88", "94", "96",
+        "103", "113", "129", "130", "131", "182", "183", "184", "185", "187", "189", "190", "191",
+        "193", "194", "195", "196", "200", "201", "202", "203", "204", "205", "206",
+    ];
+    if input.category.trim().is_empty()
+        || input.category.chars().count() > 80
+        || input
+            .menu_id
+            .as_deref()
+            .is_some_and(|id| !valid_menu_ids.contains(&id))
     {
-        return Err("게시판 분류를 선택해 주세요.".into());
+        return Err("Choose a valid board and category.".into());
     }
     if input.title.trim().is_empty() || input.title.chars().count() > 120 {
-        return Err("제목은 1자 이상 120자 이하로 입력해 주세요.".into());
+        return Err("Title must contain 1 to 120 characters.".into());
     }
     if input.body.trim().is_empty() || input.body.chars().count() > 20_000 {
-        return Err("내용은 1자 이상 20,000자 이하로 입력해 주세요.".into());
+        return Err("Body must contain 1 to 20,000 characters.".into());
+    }
+    if input
+        .image_data
+        .as_ref()
+        .is_some_and(|image| image.len() > 1_450_000)
+    {
+        return Err("Image data exceeds the upload limit.".into());
     }
     Ok(())
 }
 
+fn decode_notice_image(value: &str) -> Result<(String, Vec<u8>), String> {
+    let (metadata, encoded) = value.split_once(',').ok_or("Invalid image data.")?;
+    let content_type = match metadata {
+        "data:image/jpeg;base64" => "image/jpeg",
+        "data:image/png;base64" => "image/png",
+        "data:image/webp;base64" => "image/webp",
+        _ => return Err("Only JPG, PNG, and WEBP images are allowed.".into()),
+    };
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|_| "Invalid base64 image data.")?;
+    let valid_signature = match content_type {
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
+        _ => false,
+    };
+    if bytes.is_empty() || bytes.len() > 1_048_576 || !valid_signature {
+        return Err("Image is invalid or exceeds 1 MB.".into());
+    }
+    Ok((content_type.into(), bytes))
+}
+
 async fn initialize_db(db: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("CREATE TABLE IF NOT EXISTS notices (id TEXT PRIMARY KEY, created_at BIGINT NOT NULL, payload JSONB NOT NULL)").execute(db).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS notice_images (notice_id TEXT PRIMARY KEY REFERENCES notices(id) ON DELETE CASCADE, content_type TEXT NOT NULL, data BYTEA NOT NULL)").execute(db).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at BIGINT NOT NULL)").execute(db).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS login_attempts (ip TEXT NOT NULL, attempted_at BIGINT NOT NULL)").execute(db).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS site_pages (menu_no TEXT PRIMARY KEY, title TEXT NOT NULL, payload JSONB NOT NULL)").execute(db).await?;
@@ -232,6 +286,8 @@ async fn initialize_db(db: &PgPool) -> Result<(), sqlx::Error> {
             let notice = Notice {
                 id: Uuid::new_v4().to_string(),
                 category: category.into(),
+                menu_id: None,
+                image_url: None,
                 title: title.into(),
                 body: body.into(),
                 published: true,
@@ -495,7 +551,11 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
     let contact_intent = ["연락처", "전화번호", "전화", "주소", "오시는길", "위치"]
         .iter()
         .any(|term| query_text.replace(' ', "").contains(term));
-    if terms.len() > 1 && terms.iter().any(|term| !matches!(term.as_str(), "학교" | "안내" | "문의" | "정보")) {
+    if terms.len() > 1
+        && terms
+            .iter()
+            .any(|term| !matches!(term.as_str(), "학교" | "안내" | "문의" | "정보"))
+    {
         terms.retain(|term| !matches!(term.as_str(), "학교" | "안내" | "문의" | "정보"));
     }
     if contact_intent {
@@ -809,7 +869,20 @@ async fn list_notices(
         Ok(notices) => Json(
             notices
                 .into_iter()
-                .filter(|n| n.published && query.get("category").is_none_or(|c| c == &n.category))
+                .filter(|n| {
+                    n.published
+                        && if let Some(menu_id) = query.get("menu_id") {
+                            n.menu_id.as_deref() == Some(menu_id)
+                                || (n.menu_id.is_none()
+                                    && query
+                                        .get("category")
+                                        .is_some_and(|category| category == &n.category))
+                        } else {
+                            query
+                                .get("category")
+                                .is_none_or(|category| category == &n.category)
+                        }
+                })
                 .collect::<Vec<_>>(),
         )
         .into_response(),
@@ -838,6 +911,35 @@ async fn get_notice(State(state): State<AppState>, Path(id): Path<String>) -> Re
     }
 }
 
+async fn notice_image(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT content_type, data FROM notice_images WHERE notice_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some((content_type, bytes))) => {
+            let mut response = Body::from(bytes).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(&content_type)
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+            );
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=3600"),
+            );
+            response
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "이미지를 불러오지 못했습니다.",
+        ),
+    }
+}
+
 async fn admin_notices(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = require_admin(&headers, &state).await {
         return response;
@@ -862,26 +964,74 @@ async fn create_notice(
     if let Err(error) = validate_notice(&input) {
         return message(StatusCode::BAD_REQUEST, error);
     }
+    let image = match input
+        .image_data
+        .as_deref()
+        .map(decode_notice_image)
+        .transpose()
+    {
+        Ok(image) => image,
+        Err(error) => return message(StatusCode::BAD_REQUEST, error),
+    };
     let now = now_seconds();
+    let id = Uuid::new_v4().to_string();
     let notice = Notice {
-        id: Uuid::new_v4().to_string(),
+        id: id.clone(),
         category: input.category.trim().into(),
+        menu_id: input.menu_id,
+        image_url: image.as_ref().map(|_| format!("/notices/{id}/image")),
         title: input.title.trim().into(),
         body: input.body.trim().into(),
         published: input.published,
         created_at: now.to_string(),
         updated_at: now.to_string(),
     };
-    match sqlx::query("INSERT INTO notices (id, created_at, payload) VALUES ($1, $2, $3)")
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The request could not be saved.",
+            );
+        }
+    };
+    if sqlx::query("INSERT INTO notices (id, created_at, payload) VALUES ($1, $2, $3)")
         .bind(&notice.id)
         .bind(now)
         .bind(serde_json::to_value(&notice).unwrap_or_default())
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
+        .is_err()
     {
-        Ok(_) => (StatusCode::CREATED, Json(notice)).into_response(),
-        Err(_) => message(StatusCode::INTERNAL_SERVER_ERROR, "저장하지 못했습니다."),
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The request could not be saved.",
+        );
     }
+    if let Some((content_type, bytes)) = image {
+        if sqlx::query(
+            "INSERT INTO notice_images (notice_id, content_type, data) VALUES ($1, $2, $3)",
+        )
+        .bind(&notice.id)
+        .bind(content_type)
+        .bind(bytes)
+        .execute(&mut *tx)
+        .await
+        .is_err()
+        {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The request could not be saved.",
+            );
+        }
+    }
+    if tx.commit().await.is_err() {
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The request could not be saved.",
+        );
+    }
+    (StatusCode::CREATED, Json(notice)).into_response()
 }
 
 async fn update_notice(
@@ -896,49 +1046,99 @@ async fn update_notice(
     if let Err(error) = validate_notice(&input) {
         return message(StatusCode::BAD_REQUEST, error);
     }
-    let old = match sqlx::query_scalar::<_, serde_json::Value>(
+    let image = match input
+        .image_data
+        .as_deref()
+        .map(decode_notice_image)
+        .transpose()
+    {
+        Ok(image) => image,
+        Err(error) => return message(StatusCode::BAD_REQUEST, error),
+    };
+    let old_value = match sqlx::query_scalar::<_, serde_json::Value>(
         "SELECT payload FROM notices WHERE id = $1",
     )
     .bind(&id)
     .fetch_optional(&state.db)
     .await
     {
-        Ok(Some(value)) => match serde_json::from_value::<Notice>(value) {
-            Ok(notice) => notice,
-            Err(_) => {
-                return message(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "게시물을 읽지 못했습니다.",
-                );
-            }
-        },
-        Ok(None) => return message(StatusCode::NOT_FOUND, "게시물을 찾을 수 없습니다."),
+        Ok(Some(value)) => value,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => {
             return message(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "게시물을 읽지 못했습니다.",
+                "The request could not be saved.",
             );
         }
+    };
+    let old = match serde_json::from_value::<Notice>(old_value) {
+        Ok(notice) => notice,
+        Err(_) => return message(StatusCode::INTERNAL_SERVER_ERROR, "Invalid notice data."),
+    };
+    let image_url = if image.is_some() {
+        Some(format!("/notices/{id}/image"))
+    } else if input.remove_image {
+        None
+    } else {
+        old.image_url.clone()
     };
     let notice = Notice {
         id: id.clone(),
         category: input.category.trim().into(),
+        menu_id: input.menu_id,
+        image_url,
         title: input.title.trim().into(),
         body: input.body.trim().into(),
         published: input.published,
         created_at: old.created_at,
         updated_at: now_seconds().to_string(),
     };
-    match sqlx::query("UPDATE notices SET payload = $2 WHERE id = $1")
-        .bind(id)
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The request could not be saved.",
+            );
+        }
+    };
+    if sqlx::query("UPDATE notices SET payload = $2 WHERE id = $1")
+        .bind(&id)
         .bind(serde_json::to_value(&notice).unwrap_or_default())
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await
+        .is_err()
     {
-        Ok(result) if result.rows_affected() > 0 => Json(notice).into_response(),
-        Ok(_) => message(StatusCode::NOT_FOUND, "게시물을 찾을 수 없습니다."),
-        Err(_) => message(StatusCode::INTERNAL_SERVER_ERROR, "수정하지 못했습니다."),
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The request could not be saved.",
+        );
     }
+    if let Some((content_type, bytes)) = image {
+        if sqlx::query("INSERT INTO notice_images (notice_id, content_type, data) VALUES ($1, $2, $3) ON CONFLICT (notice_id) DO UPDATE SET content_type = EXCLUDED.content_type, data = EXCLUDED.data")
+            .bind(&id).bind(content_type).bind(bytes).execute(&mut *tx).await.is_err() {
+            return message(StatusCode::INTERNAL_SERVER_ERROR, "The request could not be saved.");
+        }
+    } else if input.remove_image {
+        if sqlx::query("DELETE FROM notice_images WHERE notice_id = $1")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .is_err()
+        {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The request could not be saved.",
+            );
+        }
+    }
+    if tx.commit().await.is_err() {
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The request could not be saved.",
+        );
+    }
+    Json(notice).into_response()
 }
 
 async fn delete_notice(
@@ -1005,6 +1205,7 @@ async fn app() -> Result<Router, Error> {
         .route("/api/admin/site-import", post(import_site))
         .route("/api/notices", get(list_notices))
         .route("/api/notices/{id}", get(get_notice))
+        .route("/api/notices/{id}/image", get(notice_image))
         .route("/api/admin/login", post(login))
         .route("/api/admin/logout", post(logout))
         .route("/api/admin/session", get(admin_session))
@@ -1034,4 +1235,39 @@ async fn main() -> Result<(), Error> {
         .layer(VercelLayer::new())
         .service(app().await?);
     vercel_runtime::run(service).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NoticeInput, STANDARD, decode_notice_image, validate_notice};
+    use base64::Engine;
+
+    fn valid_notice(menu_id: Option<&str>) -> NoticeInput {
+        NoticeInput {
+            category: "공지사항".into(),
+            menu_id: menu_id.map(str::to_owned),
+            image_data: None,
+            remove_image: false,
+            title: "Test title".into(),
+            body: "Test body".into(),
+            published: true,
+        }
+    }
+
+    #[test]
+    fn accepts_a_migrated_board_and_rejects_unknown_board_ids() {
+        assert!(validate_notice(&valid_notice(Some("47"))).is_ok());
+        assert!(validate_notice(&valid_notice(Some("999"))).is_err());
+    }
+
+    #[test]
+    fn accepts_only_supported_images_with_matching_file_signatures() {
+        let png = STANDARD.encode(b"\x89PNG\r\n\x1a\n");
+        let (content_type, bytes) = decode_notice_image(&format!("data:image/png;base64,{png}"))
+            .expect("valid PNG signature should be accepted");
+        assert_eq!(content_type, "image/png");
+        assert_eq!(bytes, b"\x89PNG\r\n\x1a\n");
+        assert!(decode_notice_image("data:image/svg+xml;base64,PHN2Zz4=").is_err());
+        assert!(decode_notice_image("data:image/png;base64,dGVzdA==").is_err());
+    }
 }
