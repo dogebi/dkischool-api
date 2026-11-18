@@ -30,6 +30,7 @@ use vercel_runtime::axum::VercelLayer;
 const SESSION_COOKIE: &str = "dkis_admin";
 const SESSION_SECONDS: i64 = 8 * 60 * 60;
 const MAX_SOURCE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 const ALLOWED_IMAGE_HOSTS: [&str; 16] = [
     "dkischool.org",
     "www.dkischool.org",
@@ -260,18 +261,8 @@ fn decode_notice_image(value: &str) -> Result<(String, Vec<u8>), String> {
     Ok((content_type.into(), bytes))
 }
 
-async fn initialize_db(db: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query("CREATE TABLE IF NOT EXISTS notices (id TEXT PRIMARY KEY, created_at BIGINT NOT NULL, payload JSONB NOT NULL)").execute(db).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS notice_images (notice_id TEXT PRIMARY KEY REFERENCES notices(id) ON DELETE CASCADE, content_type TEXT NOT NULL, data BYTEA NOT NULL)").execute(db).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS admin_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at BIGINT NOT NULL)").execute(db).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS login_attempts (ip TEXT NOT NULL, attempted_at BIGINT NOT NULL)").execute(db).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS site_pages (menu_no TEXT PRIMARY KEY, title TEXT NOT NULL, payload JSONB NOT NULL)").execute(db).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS site_articles (menu_no TEXT NOT NULL, bno TEXT NOT NULL, sort_order BIGINT NOT NULL, payload JSONB NOT NULL, PRIMARY KEY (menu_no, bno))").execute(db).await?;
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS site_articles_order_idx ON site_articles (menu_no, sort_order)",
-    )
-    .execute(db)
-    .await?;
+async fn initialize_db(db: &PgPool) -> Result<(), Error> {
+    MIGRATOR.run(db).await?;
     sqlx::query("DELETE FROM admin_sessions WHERE expires_at <= $1")
         .bind(now_seconds())
         .execute(db)
