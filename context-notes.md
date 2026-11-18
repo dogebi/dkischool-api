@@ -9,3 +9,7 @@
 - 기존 Neon 테이블을 보존하도록 첫 SQLx 마이그레이션은 모든 테이블과 정렬 인덱스를 `IF NOT EXISTS`로 선언한다. 앱 시작 시 매번 수행하던 테이블 DDL은 제거하고 SQLx 마이그레이터로 버전을 기록한다.
 - 검색은 기존 `ILIKE` 결과 규칙을 유지하고 JSONB 직렬화 표현식에 `pg_trgm` GIN 인덱스를 추가했다. 한국어 검색어는 원형을 보존하면서 조사 제거 형태를 최대 8개 후보에 포함한다.
 - 관리 첨부파일은 `notice_attachments` BYTEA 테이블에 파일 본문을 별도로 저장하고, Notice JSONB에는 메타데이터만 둔다. 한 요청은 파일 하나(최대 3 MiB), 공지당 20개이며, 기존 `image_url`은 유지한다. 비공개 첨부파일은 관리자 세션으로만 접근 가능하고 `private, no-store`로 응답한다.
+- 2026-11-18 운영 점검: Vercel 프로덕션 별칭이 최신 커밋 `7c49120` 배포를 가리키고, 배포 로그의 Git 커밋과 Ready 상태를 확인했다. 보호된 배포별 URL 대신 공개 별칭 `dkischool-api.vercel.app`으로 확인했다.
+- 공개 API `/api/health`와 `/api/site/pages/13`은 HTTP 200을 반환했다. 관리자 쿠키 없는 첨부 업로드 요청은 HTTP 401과 로그인 안내를 반환해 경로와 인증 가드를 확인했다.
+- 운영 챗봇 검색에서 `전화번호`, `오시는 길`, `입학`, `급식` 질문이 각 관련 페이지나 게시물을 반환했다.
+- `cargo fmt --check`, `cargo test`(5개 통과), `cargo check`, `git diff --check`, 프런트엔드 `npm run build --workspace frontend`가 통과했다. 별도 Neon 테스트 브랜치가 없어 신규 설치/기존 DB 업그레이드 E2E와 인증된 첨부파일 전체 수명주기 테스트는 남아 있다. 관리자 자격 증명은 가져오거나 사용하지 않았다.
