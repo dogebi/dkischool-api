@@ -747,9 +747,9 @@ async fn chat_feedback(State(state): State<AppState>, Json(input): Json<ChatFeed
         );
     }
     let statement = if input.liked {
-        "INSERT INTO chat_likes (question_key, result_url, visitor) VALUES ($1, $2, $3::uuid) ON CONFLICT DO NOTHING"
+        "INSERT INTO chat_likes (question_key, result_url, visitor) VALUES ($1, $2, $3::text::uuid) ON CONFLICT DO NOTHING"
     } else {
-        "DELETE FROM chat_likes WHERE question_key = $1 AND result_url = $2 AND visitor = $3::uuid"
+        "DELETE FROM chat_likes WHERE question_key = $1 AND result_url = $2 AND visitor = $3::text::uuid"
     };
     match sqlx::query(statement)
         .bind(chat_question_key(&input.message))
@@ -910,7 +910,7 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
     let visitor = input.visitor.filter(|id| Uuid::parse_str(id).is_ok());
     let urls: Vec<_> = matches.iter().map(|item| item.url.clone()).collect();
     let reactions = sqlx::query_as::<_, (String, i64, bool)>(
-        "SELECT result_url, COUNT(*), BOOL_OR(visitor = $3::uuid) IS TRUE FROM chat_likes WHERE question_key = $1 AND result_url = ANY($2) GROUP BY result_url"
+        "SELECT result_url, COUNT(*), BOOL_OR(visitor = $3::text::uuid) IS TRUE FROM chat_likes WHERE question_key = $1 AND result_url = ANY($2) GROUP BY result_url"
     ).bind(chat_question_key(query_text)).bind(&urls).bind(visitor).fetch_all(&state.db).await.unwrap_or_default();
     let like_count = |url: &str| {
         reactions
