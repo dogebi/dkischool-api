@@ -513,6 +513,55 @@ fn excerpt(value: &str, terms: &[String]) -> String {
     )
 }
 
+fn normalized_search_terms(query: &str) -> Vec<String> {
+    let particles = [
+        "에서는",
+        "으로",
+        "에서",
+        "에게",
+        "부터",
+        "까지",
+        "은",
+        "는",
+        "이",
+        "가",
+        "을",
+        "를",
+        "에",
+        "의",
+        "도",
+        "만",
+        "와",
+        "과",
+        "로",
+    ];
+    let mut terms = Vec::new();
+    for raw_term in query.split_whitespace() {
+        let term = raw_term.trim_matches(|character: char| !character.is_alphanumeric());
+        if term.chars().count() < 2 {
+            continue;
+        }
+        if !terms.iter().any(|existing| existing == term) {
+            terms.push(term.to_owned());
+        }
+        for particle in particles {
+            if let Some(stem) = term.strip_suffix(particle)
+                && stem.chars().count() >= 2
+            {
+                if !terms.iter().any(|existing| existing == stem) {
+                    terms.push(stem.to_owned());
+                }
+                break;
+            }
+        }
+        if terms.len() >= 8 {
+            terms.truncate(8);
+            break;
+        }
+    }
+    terms
+}
+
 async fn matching_content(
     db: &PgPool,
     table: &'static str,
@@ -558,13 +607,7 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
             "질문은 2자 이상 300자 이하로 입력해 주세요.",
         );
     }
-    let mut terms = query_text
-        .split_whitespace()
-        .map(|term| term.trim_matches(|character: char| !character.is_alphanumeric()))
-        .filter(|term| term.chars().count() >= 2)
-        .take(8)
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let mut terms = normalized_search_terms(query_text);
     let contact_intent = ["연락처", "전화번호", "전화", "주소", "오시는길", "위치"]
         .iter()
         .any(|term| query_text.replace(' ', "").contains(term));
@@ -1264,7 +1307,8 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NoticeInput, STANDARD, allowed_source_image_url, decode_notice_image, validate_notice,
+        NoticeInput, STANDARD, allowed_source_image_url, decode_notice_image,
+        normalized_search_terms, validate_notice,
     };
     use base64::Engine;
 
@@ -1314,5 +1358,15 @@ mod tests {
         assert!(!allowed_source_image_url(
             &reqwest::Url::parse("https://user@dkischool.org/image.jpg").unwrap()
         ));
+    }
+
+    #[test]
+    fn search_terms_match_korean_queries_with_particles() {
+        let terms = normalized_search_terms("급식은 어디에서 확인하나요?");
+        assert!(terms.iter().any(|term| term == "급식은"));
+        assert!(terms.iter().any(|term| term == "급식"));
+        assert!(terms.iter().any(|term| term == "어디에서"));
+        assert!(terms.iter().any(|term| term == "어디"));
+        assert!(terms.len() <= 8);
     }
 }
