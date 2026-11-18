@@ -122,6 +122,7 @@ struct SitePageQuery {
 #[derive(Deserialize)]
 struct ChatRequest {
     message: String,
+    visitor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -674,6 +675,97 @@ async fn matching_content(
         .await
 }
 
+fn chat_question_key(question: &str) -> String {
+    let normalized = question
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    format!("{:x}", Sha256::digest(normalized.as_bytes()))
+}
+
+#[test]
+fn chat_feedback_key_ignores_case_and_whitespace() {
+    assert_eq!(
+        chat_question_key("  DKIS   입학 "),
+        chat_question_key("dkis 입학")
+    );
+    assert_ne!(
+        chat_question_key("초등 입학"),
+        chat_question_key("중등 입학")
+    );
+}
+
+#[test]
+fn chat_topics_use_only_public_labels() {
+    assert_eq!(chat_topic("초등 전학 서류"), Some("입학 안내"));
+    assert_eq!(chat_topic("등록금 얼마인가요"), Some("학비"));
+    assert_eq!(chat_topic("오늘 점심"), Some("급식 식단"));
+    assert_eq!(chat_topic("교무실 전화번호"), Some("학교 연락처"));
+    assert_eq!(chat_topic("알려 드릴 개인 사정"), None);
+}
+
+fn chat_topic(question: &str) -> Option<&'static str> {
+    [
+        ("입학 안내", &["입학", "전학"][..]),
+        ("학비", &["학비", "등록금", "수업료"][..]),
+        ("급식 식단", &["급식", "식단", "점심"][..]),
+        ("학교 연락처", &["연락처", "전화번호", "교무실 전화"][..]),
+        ("학사 일정", &["학사 일정", "학사일정", "방학"][..]),
+    ]
+    .into_iter()
+    .find(|(_, terms)| terms.iter().any(|term| question.contains(term)))
+    .map(|(topic, _)| topic)
+}
+
+async fn popular_chat_topics(State(state): State<AppState>) -> Response {
+    match sqlx::query_scalar::<_, String>(
+        "SELECT topic FROM chat_topic_daily WHERE day >= CURRENT_DATE - 29 GROUP BY topic ORDER BY SUM(searches) DESC, topic LIMIT 5"
+    ).fetch_all(&state.db).await {
+        Ok(topics) => Json(serde_json::json!({"topics": topics})).into_response(),
+        Err(_) => message(StatusCode::INTERNAL_SERVER_ERROR, "인기 질문을 불러오지 못했습니다."),
+    }
+}
+
+#[derive(Deserialize)]
+struct ChatFeedback {
+    message: String,
+    visitor: String,
+    url: String,
+    liked: bool,
+}
+
+async fn chat_feedback(State(state): State<AppState>, Json(input): Json<ChatFeedback>) -> Response {
+    if Uuid::parse_str(&input.visitor).is_err()
+        || !(2..=300).contains(&input.message.trim().chars().count())
+        || !input.url.starts_with("#/page/")
+        || input.url.len() > 160
+    {
+        return message(
+            StatusCode::BAD_REQUEST,
+            "검색 결과 반응 정보가 올바르지 않습니다.",
+        );
+    }
+    let statement = if input.liked {
+        "INSERT INTO chat_likes (question_key, result_url, visitor) VALUES ($1, $2, $3::uuid) ON CONFLICT DO NOTHING"
+    } else {
+        "DELETE FROM chat_likes WHERE question_key = $1 AND result_url = $2 AND visitor = $3::uuid"
+    };
+    match sqlx::query(statement)
+        .bind(chat_question_key(&input.message))
+        .bind(&input.url)
+        .bind(&input.visitor)
+        .execute(&state.db)
+        .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "반응을 저장하지 못했습니다.",
+        ),
+    }
+}
+
 async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>) -> Response {
     let query_text = input.message.trim();
     if query_text.chars().count() < 2 || query_text.chars().count() > 300 {
@@ -811,9 +903,40 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
             });
         }
     }
-    matches.sort_by(|left, right| right.score.cmp(&left.score));
+    if let Some(topic) = chat_topic(query_text) {
+        let _ = sqlx::query("INSERT INTO chat_topic_daily (topic, day) VALUES ($1, CURRENT_DATE) ON CONFLICT (topic, day) DO UPDATE SET searches = chat_topic_daily.searches + 1")
+            .bind(topic).execute(&state.db).await;
+    }
+    let visitor = input.visitor.filter(|id| Uuid::parse_str(id).is_ok());
+    let urls: Vec<_> = matches.iter().map(|item| item.url.clone()).collect();
+    let reactions = sqlx::query_as::<_, (String, i64, bool)>(
+        "SELECT result_url, COUNT(*), BOOL_OR(visitor = $3::uuid) IS TRUE FROM chat_likes WHERE question_key = $1 AND result_url = ANY($2) GROUP BY result_url"
+    ).bind(chat_question_key(query_text)).bind(&urls).bind(visitor).fetch_all(&state.db).await.unwrap_or_default();
+    let like_count = |url: &str| {
+        reactions
+            .iter()
+            .find(|row| row.0 == url)
+            .map_or(0, |row| row.1)
+    };
+    let time_sensitive = ["이번", "다음", "오늘", "내일", "최신", "식단", "급식"]
+        .iter()
+        .any(|term| query_text.contains(term));
+    matches.sort_by(|left, right| {
+        right.score.cmp(&left.score).then_with(|| {
+            if time_sensitive {
+                std::cmp::Ordering::Equal
+            } else {
+                like_count(&right.url).cmp(&like_count(&left.url))
+            }
+        })
+    });
     matches.truncate(8);
-    Json(serde_json::json!({"matches": matches})).into_response()
+    let liked: Vec<_> = reactions
+        .iter()
+        .filter(|row| row.2)
+        .map(|row| &row.0)
+        .collect();
+    Json(serde_json::json!({"matches": matches, "liked": liked})).into_response()
 }
 
 async fn import_site(
@@ -1593,6 +1716,8 @@ async fn app() -> Result<Router, Error> {
         .route("/api/site/boards/{menu_no}", get(site_board))
         .route("/api/site/articles/{menu_no}/{bno}", get(site_article))
         .route("/api/site/chat", post(site_chat))
+        .route("/api/site/chat/popular", get(popular_chat_topics))
+        .route("/api/site/chat/feedback", post(chat_feedback))
         .route("/api/admin/site-import", post(import_site))
         .route("/api/notices", get(list_notices))
         .route("/api/notices/{id}", get(get_notice))
