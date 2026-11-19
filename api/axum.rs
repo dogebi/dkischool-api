@@ -351,6 +351,14 @@ async fn initialize_db(db: &PgPool) -> Result<(), Error> {
         .bind(now_seconds() - 600)
         .execute(db)
         .await?;
+    sqlx::query("DELETE FROM chat_request_limits WHERE minute < $1")
+        .bind(now_seconds() / 60 - 1)
+        .execute(db)
+        .await?;
+    sqlx::query("DELETE FROM chat_search_receipts WHERE expires_at <= $1")
+        .bind(now_seconds())
+        .execute(db)
+        .await?;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notices")
         .fetch_one(db)
         .await?;
@@ -807,7 +815,43 @@ struct ChatFeedback {
     liked: bool,
 }
 
-async fn chat_feedback(State(state): State<AppState>, Json(input): Json<ChatFeedback>) -> Response {
+async fn chat_request_limit(
+    db: &PgPool,
+    headers: &HeaderMap,
+    scope: &str,
+    limit: i32,
+) -> Result<(), Response> {
+    let minute = now_seconds() / 60;
+    let count = sqlx::query_scalar::<_, i32>(
+        "INSERT INTO chat_request_limits (scope, client_key, minute) VALUES ($1, $2, $3)
+         ON CONFLICT (scope, client_key, minute) DO UPDATE
+         SET requests = chat_request_limits.requests + 1
+         WHERE chat_request_limits.requests < $4 RETURNING requests",
+    )
+    .bind(scope)
+    .bind(token_hash(client_ip(headers)))
+    .bind(minute)
+    .bind(limit)
+    .fetch_optional(db)
+    .await;
+    match count {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(message(StatusCode::TOO_MANY_REQUESTS, "?? ? ?? ??? ???.")),
+        Err(error) => {
+            eprintln!("Chat request limit check failed: {error}");
+            Err(message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "?? ??? ??? ??? ? ????.",
+            ))
+        }
+    }
+}
+
+async fn chat_feedback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ChatFeedback>,
+) -> Response {
     if Uuid::parse_str(&input.visitor).is_err()
         || !(2..=300).contains(&input.message.trim().chars().count())
         || !input.url.starts_with("#/page/")
@@ -818,13 +862,38 @@ async fn chat_feedback(State(state): State<AppState>, Json(input): Json<ChatFeed
             "검색 결과 반응 정보가 올바르지 않습니다.",
         );
     }
+    if let Err(response) = chat_request_limit(&state.db, &headers, "feedback", 60).await {
+        return response;
+    }
+    let question_key = chat_question_key(&input.message);
+    if input.liked {
+        let issued = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM chat_search_receipts
+             WHERE visitor = $1::text::uuid AND question_key = $2
+               AND $3 = ANY(result_urls) AND expires_at > $4)",
+        )
+        .bind(&input.visitor)
+        .bind(&question_key)
+        .bind(&input.url)
+        .bind(now_seconds())
+        .fetch_one(&state.db)
+        .await;
+        match issued {
+            Ok(true) => {}
+            Ok(false) => return message(StatusCode::BAD_REQUEST, "??? ?? ??? ? ??? ?? ???."),
+            Err(error) => {
+                eprintln!("Chat search receipt lookup failed: {error}");
+                return message(StatusCode::SERVICE_UNAVAILABLE, "?? ??? ??? ? ????.");
+            }
+        }
+    }
     let statement = if input.liked {
         "INSERT INTO chat_likes (question_key, result_url, visitor) VALUES ($1, $2, $3::text::uuid) ON CONFLICT DO NOTHING"
     } else {
         "DELETE FROM chat_likes WHERE question_key = $1 AND result_url = $2 AND visitor = $3::text::uuid"
     };
     match sqlx::query(statement)
-        .bind(chat_question_key(&input.message))
+        .bind(question_key)
         .bind(&input.url)
         .bind(&input.visitor)
         .execute(&state.db)
@@ -838,7 +907,14 @@ async fn chat_feedback(State(state): State<AppState>, Json(input): Json<ChatFeed
     }
 }
 
-async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>) -> Response {
+async fn site_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ChatRequest>,
+) -> Response {
+    if let Err(response) = chat_request_limit(&state.db, &headers, "search", 30).await {
+        return response;
+    }
     let query_text = input.message.trim();
     if query_text.chars().count() < 2 || query_text.chars().count() > 300 {
         return message(
@@ -975,14 +1051,16 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
         }
     }
     if let Some(topic) = chat_topic(query_text) {
-        let _ = sqlx::query("INSERT INTO chat_topic_daily (topic, day, measured_searches, no_results) VALUES ($1, CURRENT_DATE, 1, $2) ON CONFLICT (topic, day) DO UPDATE SET searches = chat_topic_daily.searches + 1, measured_searches = chat_topic_daily.measured_searches + 1, no_results = chat_topic_daily.no_results + EXCLUDED.no_results")
-            .bind(topic).bind(i64::from(matches.is_empty())).execute(&state.db).await;
+        if let Err(error) = sqlx::query("INSERT INTO chat_topic_daily (topic, day, measured_searches, no_results) VALUES ($1, CURRENT_DATE, 1, $2) ON CONFLICT (topic, day) DO UPDATE SET searches = chat_topic_daily.searches + 1, measured_searches = chat_topic_daily.measured_searches + 1, no_results = chat_topic_daily.no_results + EXCLUDED.no_results")
+            .bind(topic).bind(i64::from(matches.is_empty())).execute(&state.db).await {
+            eprintln!("Chat topic aggregation failed: {error}");
+        }
     }
     let visitor = input.visitor.filter(|id| Uuid::parse_str(id).is_ok());
     let urls: Vec<_> = matches.iter().map(|item| item.url.clone()).collect();
     let reactions = sqlx::query_as::<_, (String, i64, bool)>(
         "SELECT result_url, COUNT(*), BOOL_OR(visitor = $3::text::uuid) IS TRUE FROM chat_likes WHERE question_key = $1 AND result_url = ANY($2) GROUP BY result_url"
-    ).bind(chat_question_key(query_text)).bind(&urls).bind(visitor).fetch_all(&state.db).await.unwrap_or_default();
+    ).bind(chat_question_key(query_text)).bind(&urls).bind(&visitor).fetch_all(&state.db).await.unwrap_or_default();
     let like_count = |url: &str| {
         reactions
             .iter()
@@ -999,6 +1077,24 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
         })
     });
     matches.truncate(8);
+    if let Some(visitor) = visitor {
+        let urls: Vec<_> = matches.iter().map(|item| item.url.as_str()).collect();
+        if let Err(error) = sqlx::query(
+            "INSERT INTO chat_search_receipts (visitor, question_key, result_urls, expires_at)
+             VALUES ($1::text::uuid, $2, $3, $4)
+             ON CONFLICT (visitor, question_key) DO UPDATE
+             SET result_urls = EXCLUDED.result_urls, expires_at = EXCLUDED.expires_at",
+        )
+        .bind(visitor)
+        .bind(chat_question_key(query_text))
+        .bind(urls)
+        .bind(now_seconds() + 3600)
+        .execute(&state.db)
+        .await
+        {
+            eprintln!("Chat search receipt write failed: {error}");
+        }
+    }
     let liked: Vec<_> = reactions
         .iter()
         .filter(|row| row.2)
@@ -1103,6 +1199,16 @@ async fn reserve_login_attempt(db: &PgPool, ip: &str) -> Result<bool, sqlx::Erro
     Ok(true)
 }
 
+fn client_ip(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| value.parse::<std::net::IpAddr>().is_ok())
+        .unwrap_or("unknown")
+}
+
 async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1115,18 +1221,12 @@ async fn login(
             "서버에 관리자 계정이 설정되지 않았습니다.",
         );
     };
-    let ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .unwrap_or("unknown")
-        .trim()
-        .to_owned();
+    let ip = client_ip(&headers);
     let _ = sqlx::query("DELETE FROM login_attempts WHERE attempted_at <= $1")
         .bind(now_seconds() - 600)
         .execute(&state.db)
         .await;
-    match reserve_login_attempt(&state.db, &ip).await {
+    match reserve_login_attempt(&state.db, ip).await {
         Ok(true) => {}
         Ok(false) => {
             return message(
