@@ -195,16 +195,19 @@ async fn session_user(headers: &HeaderMap, state: &AppState) -> Option<String> {
     .flatten()
 }
 
-async fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<String, Response> {
+async fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<String, Box<Response>> {
     if state.username.is_none() || state.password_hash.is_none() {
-        return Err(message(
+        return Err(Box::new(message(
             StatusCode::SERVICE_UNAVAILABLE,
             "서버에 관리자 계정이 설정되지 않았습니다.",
-        ));
+        )));
     }
-    session_user(headers, state)
-        .await
-        .ok_or_else(|| message(StatusCode::UNAUTHORIZED, "관리자 로그인이 필요합니다."))
+    session_user(headers, state).await.ok_or_else(|| {
+        Box::new(message(
+            StatusCode::UNAUTHORIZED,
+            "관리자 로그인이 필요합니다.",
+        ))
+    })
 }
 
 fn set_session_cookie(response: &mut Response, token: &str, state: &AppState) {
@@ -737,7 +740,7 @@ async fn admin_chat_stats(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state).await {
-        return response;
+        return *response;
     }
     let days = match query.get("days").map(String::as_str).unwrap_or("30") {
         "7" => 7,
@@ -808,7 +811,7 @@ async fn chat_request_limit(
     headers: &HeaderMap,
     scope: &str,
     limit: i32,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let minute = now_seconds() / 60;
     let count = sqlx::query_scalar::<_, i32>(
         "INSERT INTO chat_request_limits (scope, client_key, minute) VALUES ($1, $2, $3)
@@ -824,16 +827,16 @@ async fn chat_request_limit(
     .await;
     match count {
         Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(message(
+        Ok(None) => Err(Box::new(message(
             StatusCode::TOO_MANY_REQUESTS,
             "잠시 후 다시 시도해 주세요.",
-        )),
+        ))),
         Err(error) => {
             eprintln!("Chat request limit check failed: {error}");
-            Err(message(
+            Err(Box::new(message(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "검색 서비스 상태를 확인할 수 없습니다.",
-            ))
+            )))
         }
     }
 }
@@ -854,7 +857,7 @@ async fn chat_feedback(
         );
     }
     if let Err(response) = chat_request_limit(&state.db, &headers, "feedback", 60).await {
-        return response;
+        return *response;
     }
     let question_key = chat_question_key(&input.message);
     if input.liked {
@@ -912,7 +915,7 @@ async fn site_chat(
     Json(input): Json<ChatRequest>,
 ) -> Response {
     if let Err(response) = chat_request_limit(&state.db, &headers, "search", 30).await {
-        return response;
+        return *response;
     }
     let query_text = input.message.trim();
     if query_text.chars().count() < 2 || query_text.chars().count() > 300 {
@@ -1023,38 +1026,37 @@ async fn site_chat(
             date,
         });
     }
-    if contact_intent && !matches.iter().any(|item| item.url == "#/page/20") {
-        if let Ok(Some(payload)) = sqlx::query_scalar::<_, serde_json::Value>(&format!(
+    if contact_intent
+        && !matches.iter().any(|item| item.url == "#/page/20")
+        && let Ok(Some(payload)) = sqlx::query_scalar::<_, serde_json::Value>(&format!(
             "SELECT payload FROM site_pages WHERE menu_no = '20' AND {PUBLIC_CONTENT}"
         ))
         .fetch_optional(&state.db)
         .await
-        {
-            let title = payload
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("오시는 길");
-            let body = payload
-                .get("body_html")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            matches.push(ChatMatch {
-                title: title.to_owned(),
-                excerpt: excerpt(body, &terms),
-                url: "#/page/20".to_owned(),
-                kind: "page",
-                score: 30,
-                likes: 0,
-                date: None,
-            });
-        }
+    {
+        let title = payload
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("오시는 길");
+        let body = payload
+            .get("body_html")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        matches.push(ChatMatch {
+            title: title.to_owned(),
+            excerpt: excerpt(body, &terms),
+            url: "#/page/20".to_owned(),
+            kind: "page",
+            score: 30,
+            likes: 0,
+            date: None,
+        });
     }
-    if let Some(topic) = chat_topic(query_text) {
-        if let Err(error) = sqlx::query("INSERT INTO chat_topic_daily (topic, day, measured_searches, no_results) VALUES ($1, CURRENT_DATE, 1, $2) ON CONFLICT (topic, day) DO UPDATE SET searches = chat_topic_daily.searches + 1, measured_searches = chat_topic_daily.measured_searches + 1, no_results = chat_topic_daily.no_results + EXCLUDED.no_results")
+    if let Some(topic) = chat_topic(query_text)
+        && let Err(error) = sqlx::query("INSERT INTO chat_topic_daily (topic, day, measured_searches, no_results) VALUES ($1, CURRENT_DATE, 1, $2) ON CONFLICT (topic, day) DO UPDATE SET searches = chat_topic_daily.searches + 1, measured_searches = chat_topic_daily.measured_searches + 1, no_results = chat_topic_daily.no_results + EXCLUDED.no_results")
             .bind(topic).bind(i64::from(matches.is_empty())).execute(&state.db).await {
             eprintln!("Chat topic aggregation failed: {error}");
         }
-    }
     let visitor = input.visitor.filter(|id| Uuid::parse_str(id).is_ok());
     matches.sort_by(|left, right| {
         right
@@ -1101,7 +1103,7 @@ async fn import_site(
     Json(input): Json<SiteImport>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state).await {
-        return response;
+        return *response;
     }
     if input.pages.len() + input.articles.len() > 20 {
         return message(
@@ -1499,7 +1501,7 @@ async fn upload_notice_attachment(
     mut multipart: Multipart,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state).await {
-        return response;
+        return *response;
     }
     let field = match multipart.next_field().await {
         Ok(Some(field)) if field.name() == Some("file") => field,
@@ -1612,7 +1614,7 @@ async fn delete_notice_attachment(
     headers: HeaderMap,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state).await {
-        return response;
+        return *response;
     }
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
@@ -1679,7 +1681,7 @@ async fn delete_notice_attachment(
 
 async fn admin_notices(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(response) = require_admin(&headers, &state).await {
-        return response;
+        return *response;
     }
     match read_notices(&state.db).await {
         Ok(notices) => Json(notices).into_response(),
@@ -1696,7 +1698,7 @@ async fn create_notice(
     Json(input): Json<NoticeInput>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state).await {
-        return response;
+        return *response;
     }
     if let Err(error) = validate_notice(&input) {
         return message(StatusCode::BAD_REQUEST, error);
@@ -1746,8 +1748,8 @@ async fn create_notice(
             "The request could not be saved.",
         );
     }
-    if let Some((content_type, bytes)) = image {
-        if sqlx::query(
+    if let Some((content_type, bytes)) = image
+        && sqlx::query(
             "INSERT INTO notice_images (notice_id, content_type, data) VALUES ($1, $2, $3)",
         )
         .bind(&notice.id)
@@ -1756,12 +1758,11 @@ async fn create_notice(
         .execute(&mut *tx)
         .await
         .is_err()
-        {
-            return message(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "The request could not be saved.",
-            );
-        }
+    {
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The request could not be saved.",
+        );
     }
     if tx.commit().await.is_err() {
         return message(
@@ -1779,7 +1780,7 @@ async fn update_notice(
     Json(input): Json<NoticeInput>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state).await {
-        return response;
+        return *response;
     }
     if let Err(error) = validate_notice(&input) {
         return message(StatusCode::BAD_REQUEST, error);
@@ -1858,18 +1859,17 @@ async fn update_notice(
             .bind(&id).bind(content_type).bind(bytes).execute(&mut *tx).await.is_err() {
             return message(StatusCode::INTERNAL_SERVER_ERROR, "The request could not be saved.");
         }
-    } else if input.remove_image {
-        if sqlx::query("DELETE FROM notice_images WHERE notice_id = $1")
+    } else if input.remove_image
+        && sqlx::query("DELETE FROM notice_images WHERE notice_id = $1")
             .bind(&id)
             .execute(&mut *tx)
             .await
             .is_err()
-        {
-            return message(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "The request could not be saved.",
-            );
-        }
+    {
+        return message(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "The request could not be saved.",
+        );
     }
     if tx.commit().await.is_err() {
         return message(
@@ -1886,7 +1886,7 @@ async fn delete_notice(
     Path(id): Path<String>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state).await {
-        return response;
+        return *response;
     }
     match sqlx::query("DELETE FROM notices WHERE id = $1")
         .bind(id)
@@ -2184,6 +2184,41 @@ mod tests {
             }
         }
 
+        let winning_url = "#/page/99";
+        for id in 90..=99 {
+            let id = id.to_string();
+            sqlx::query("INSERT INTO site_pages VALUES ($1, 'Handbook', $2)")
+                .bind(&id)
+                .bind(json!({"menu_no":id,"title":"Handbook"}))
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO chat_likes VALUES ($1, $2, $3::text::uuid)")
+            .bind(chat_question_key("Handbook"))
+            .bind(winning_url)
+            .bind(&visitor)
+            .execute(&db)
+            .await
+            .unwrap();
+        let response = request(
+            "POST",
+            "/api/site/chat",
+            &origin,
+            "",
+            json_type,
+            Body::from(json!({"message":"Handbook","visitor":visitor}).to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = axum::body::to_bytes(response.into_body(), 32768)
+            .await
+            .unwrap();
+        let results: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(results["matches"][0]["url"], winning_url);
+        assert_eq!(results["liked"], json!([winning_url]));
+
         let headers = HeaderMap::new();
         assert!(chat_request_limit(&db, &headers, "test", 1).await.is_ok());
         assert_eq!(
@@ -2255,21 +2290,52 @@ mod tests {
             .await
             .unwrap();
         let multipart = b"--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.pdf\"\r\n\r\n%PDF-1.7\r\n--test--\r\n";
-        let response = request(
-            "POST",
-            &format!("/api/admin/notices/{id}/attachments"),
-            &origin,
-            &cookie,
-            "multipart/form-data; boundary=test",
-            Body::from(multipart.as_slice()),
-        )
-        .await
-        .unwrap();
-        assert!(response.status().is_success());
-        let attachment: String = sqlx::query_scalar("SELECT id FROM notice_attachments")
+        let upload_path = format!("/api/admin/notices/{id}/attachments");
+        let upload = || {
+            request(
+                "POST",
+                &upload_path,
+                &origin,
+                &cookie,
+                "multipart/form-data; boundary=test",
+                Body::from(multipart.as_slice()),
+            )
+        };
+        let (first, second) = tokio::join!(upload(), upload());
+        assert!(first.unwrap().status().is_success());
+        assert!(second.unwrap().status().is_success());
+        let attachments: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM notice_attachments ORDER BY sort_order")
+                .fetch_all(&db)
+                .await
+                .unwrap();
+        let payload: serde_json::Value = sqlx::query_scalar("SELECT payload FROM notices")
             .fetch_one(&db)
             .await
             .unwrap();
+        let listed: Vec<_> = payload["attachments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|attachment| attachment["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, attachments);
+        assert_eq!(attachments.len(), 2);
+        let attachment = &attachments[0];
+        sqlx::query("INSERT INTO notice_images VALUES ($1, 'image/png', $2)")
+            .bind(&id)
+            .bind(b"test".as_slice())
+            .execute(&db)
+            .await
+            .unwrap();
+        let image_path = format!("/api/notices/{id}/image");
+        assert_eq!(
+            request("GET", &image_path, &origin, "", json_type, Body::empty())
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
         let path = format!("/api/notices/{id}/attachments/{attachment}");
         assert_eq!(
             request("GET", &path, &origin, "", json_type, Body::empty())
@@ -2285,7 +2351,7 @@ mod tests {
                 .status(),
             200
         );
-        let mut published = draft;
+        let mut published = draft.clone();
         published["published"] = json!(true);
         assert!(
             request(
@@ -2308,6 +2374,51 @@ mod tests {
                 .status(),
             200
         );
+        for file_path in [&path, &image_path] {
+            let response = request("GET", file_path, &origin, "", json_type, Body::empty())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+        }
+        for (page, count) in [(1, 1), (2, 0)] {
+            let listing = format!("/api/notices?page={page}&per_page=1");
+            let response = request("GET", &listing, &origin, "", json_type, Body::empty())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let bytes = axum::body::to_bytes(response.into_body(), 32768)
+                .await
+                .unwrap();
+            let notices: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(notices.len(), count);
+        }
+        assert!(
+            request(
+                "PUT",
+                &format!("/api/admin/notices/{id}"),
+                &origin,
+                &cookie,
+                json_type,
+                Body::from(draft.to_string())
+            )
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+        );
+        for file_path in [&path, &image_path] {
+            assert_eq!(
+                request("GET", file_path, &origin, "", json_type, Body::empty())
+                    .await
+                    .unwrap()
+                    .status(),
+                404
+            );
+        }
         assert!(
             request(
                 "DELETE",
