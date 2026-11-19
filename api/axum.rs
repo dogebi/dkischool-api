@@ -1330,28 +1330,45 @@ async fn read_notices(db: &PgPool) -> Result<Vec<Notice>, sqlx::Error> {
         .collect())
 }
 
+#[derive(Deserialize)]
+struct NoticeListQuery {
+    menu_id: Option<String>,
+    category: Option<String>,
+    page: Option<i64>,
+    per_page: Option<i64>,
+}
+
 async fn list_notices(
     State(state): State<AppState>,
-    Query(query): Query<HashMap<String, String>>,
+    Query(query): Query<NoticeListQuery>,
 ) -> Response {
-    match read_notices(&state.db).await {
-        Ok(notices) => Json(
-            notices
+    let limit = query
+        .per_page
+        .or(query.page.map(|_| 50))
+        .map(|size| size.clamp(1, 100));
+    let offset = (query.page.unwrap_or(1).clamp(1, 100_000) - 1) * limit.unwrap_or(0);
+    let values = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT payload FROM notices
+         WHERE payload->'published' = 'true'::jsonb AND (
+             ($1::text IS NULL AND ($2::text IS NULL OR payload->>'category' = $2))
+             OR ($1 IS NOT NULL AND (
+                 payload->>'menu_id' = $1
+                 OR (payload->>'menu_id' IS NULL AND payload->>'category' = $2)
+             ))
+         )
+         ORDER BY created_at DESC, id LIMIT $3 OFFSET $4",
+    )
+    .bind(query.menu_id)
+    .bind(query.category)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&state.db)
+    .await;
+    match values {
+        Ok(values) => Json(
+            values
                 .into_iter()
-                .filter(|n| {
-                    n.published
-                        && if let Some(menu_id) = query.get("menu_id") {
-                            n.menu_id.as_deref() == Some(menu_id)
-                                || (n.menu_id.is_none()
-                                    && query
-                                        .get("category")
-                                        .is_some_and(|category| category == &n.category))
-                        } else {
-                            query
-                                .get("category")
-                                .is_none_or(|category| category == &n.category)
-                        }
-                })
+                .filter_map(|value| serde_json::from_value::<Notice>(value).ok())
                 .collect::<Vec<_>>(),
         )
         .into_response(),
@@ -1884,11 +1901,18 @@ async fn delete_notice(
 
 async fn app() -> Result<Router, Error> {
     let database_url = env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is required")?;
+    let started = std::time::Instant::now();
     let db = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
         .await?;
+    let connected = started.elapsed();
     initialize_db(&db).await?;
+    eprintln!(
+        "Database startup: connect_ms={}, initialize_ms={}",
+        connected.as_millis(),
+        (started.elapsed() - connected).as_millis()
+    );
     let same_site = env::var("COOKIE_SAME_SITE").unwrap_or_else(|_| "None".into());
     let secure_cookie =
         env::var("COOKIE_SECURE").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
