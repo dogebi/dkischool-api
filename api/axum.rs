@@ -27,6 +27,7 @@ use uuid::Uuid;
 use vercel_runtime::Error;
 use vercel_runtime::axum::VercelLayer;
 
+const PUBLIC_CONTENT: &str = "COALESCE(payload->>'access_status', '') <> 'restricted'";
 const SESSION_COOKIE: &str = "dkis_admin";
 const SESSION_SECONDS: i64 = 8 * 60 * 60;
 const MAX_SOURCE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -393,9 +394,9 @@ async fn health() -> Json<serde_json::Value> {
 }
 
 async fn site_page(State(state): State<AppState>, Path(menu_no): Path<String>) -> Response {
-    match sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT payload FROM site_pages WHERE menu_no = $1",
-    )
+    match sqlx::query_scalar::<_, serde_json::Value>(&format!(
+        "SELECT payload FROM site_pages WHERE menu_no = $1 AND {PUBLIC_CONTENT}"
+    ))
     .bind(menu_no)
     .fetch_optional(&state.db)
     .await
@@ -510,18 +511,19 @@ async fn site_board(
     let per_page = query.per_page.unwrap_or(12).clamp(1, 100);
     let offset = (page - 1) * per_page;
     let rows = sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT jsonb_build_object('menu_no', payload->'menu_no', 'bno', payload->'bno', 'title', payload->'title', 'metadata_text', payload->'metadata_text', 'images', payload->'images') FROM site_articles WHERE menu_no = $1 ORDER BY sort_order ASC LIMIT $2 OFFSET $3",
+        &format!("SELECT jsonb_build_object('menu_no', payload->'menu_no', 'bno', payload->'bno', 'title', payload->'title', 'metadata_text', payload->'metadata_text', 'images', payload->'images') FROM site_articles WHERE menu_no = $1 AND {PUBLIC_CONTENT} ORDER BY sort_order ASC LIMIT $2 OFFSET $3"),
     )
     .bind(&menu_no)
     .bind(per_page)
     .bind(offset)
     .fetch_all(&state.db)
     .await;
-    let total =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM site_articles WHERE menu_no = $1")
-            .bind(&menu_no)
-            .fetch_one(&state.db)
-            .await;
+    let total = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COUNT(*) FROM site_articles WHERE menu_no = $1 AND {PUBLIC_CONTENT}"
+    ))
+    .bind(&menu_no)
+    .fetch_one(&state.db)
+    .await;
     match (rows, total) {
         (Ok(items), Ok(total)) => Json(
             serde_json::json!({"items": items, "page": page, "per_page": per_page, "total": total}),
@@ -535,9 +537,9 @@ async fn site_article(
     State(state): State<AppState>,
     Path((menu_no, bno)): Path<(String, String)>,
 ) -> Response {
-    match sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT payload FROM site_articles WHERE menu_no = $1 AND bno = $2",
-    )
+    match sqlx::query_scalar::<_, serde_json::Value>(&format!(
+        "SELECT payload FROM site_articles WHERE menu_no = $1 AND bno = $2 AND {PUBLIC_CONTENT}"
+    ))
     .bind(menu_no)
     .bind(bno)
     .fetch_optional(&state.db)
@@ -653,9 +655,7 @@ async fn matching_content(
             .push_bind(format!("%{term}%"));
     }
     query.push(")");
-    if table == "site_pages" {
-        query.push(" AND COALESCE(payload->>'access_status', '') <> 'restricted'");
-    }
+    query.push(" AND ").push(PUBLIC_CONTENT);
     query.push(" ORDER BY (");
     for (index, term) in terms.iter().enumerate() {
         if index > 0 {
@@ -860,13 +860,6 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
     };
     let mut matches = Vec::new();
     for payload in pages {
-        if payload
-            .get("access_status")
-            .and_then(serde_json::Value::as_str)
-            == Some("restricted")
-        {
-            continue;
-        }
         let Some(menu_no) = payload.get("menu_no").and_then(serde_json::Value::as_str) else {
             continue;
         };
@@ -935,9 +928,9 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
         });
     }
     if contact_intent && !matches.iter().any(|item| item.url == "#/page/20") {
-        if let Ok(Some(payload)) = sqlx::query_scalar::<_, serde_json::Value>(
-            "SELECT payload FROM site_pages WHERE menu_no = '20'",
-        )
+        if let Ok(Some(payload)) = sqlx::query_scalar::<_, serde_json::Value>(&format!(
+            "SELECT payload FROM site_pages WHERE menu_no = '20' AND {PUBLIC_CONTENT}"
+        ))
         .fetch_optional(&state.db)
         .await
         {
