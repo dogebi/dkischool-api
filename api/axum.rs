@@ -136,6 +136,8 @@ struct ChatMatch {
     kind: &'static str,
     #[serde(skip)]
     score: usize,
+    #[serde(skip)]
+    date: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -642,18 +644,23 @@ fn normalized_search_terms(query: &str) -> Vec<String> {
     terms
 }
 
+const SEARCH_DATE: &str = "replace(substring(payload->>'metadata_text' from '[0-9]{4}[-.][0-9]{2}[-.][0-9]{2}'), '.', '-')";
+
 async fn matching_content(
     db: &PgPool,
     table: &'static str,
     terms: &[String],
-) -> Result<Vec<serde_json::Value>, sqlx::Error> {
-    let mut query = QueryBuilder::<Postgres>::new(format!("SELECT payload FROM {table} WHERE ("));
+    time_sensitive: bool,
+) -> Result<Vec<(serde_json::Value, Option<String>)>, sqlx::Error> {
+    let mut query = QueryBuilder::<Postgres>::new(format!(
+        "SELECT payload, {SEARCH_DATE} FROM {table} WHERE ("
+    ));
     for (index, term) in terms.iter().enumerate() {
         if index > 0 {
             query.push(" OR ");
         }
         query
-            .push("payload::text ILIKE ")
+            .push("(coalesce(payload->>'title', '') || ' ' || school_search_body(payload)) ILIKE ")
             .push_bind(format!("%{term}%"));
     }
     query.push(")");
@@ -666,13 +673,21 @@ async fn matching_content(
         query
             .push("CASE WHEN payload->>'title' ILIKE ")
             .push_bind(format!("%{term}%"))
-            .push(" THEN 10 ELSE 0 END + CASE WHEN payload->>'body_html' ILIKE ")
+            .push(" THEN 10 ELSE 0 END + CASE WHEN school_search_body(payload) ILIKE ")
             .push_bind(format!("%{term}%"))
             .push(" THEN 1 ELSE 0 END");
     }
+    query.push(") DESC");
+    if time_sensitive {
+        query.push(", 2 DESC NULLS LAST");
+    }
+    query.push(", menu_no");
+    if table == "site_articles" {
+        query.push(", bno");
+    }
     query
-        .push(") DESC LIMIT 8")
-        .build_query_scalar::<serde_json::Value>()
+        .push(" LIMIT 8")
+        .build_query_as::<(serde_json::Value, Option<String>)>()
         .fetch_all(db)
         .await
 }
@@ -852,8 +867,11 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
     if terms.is_empty() {
         return Json(serde_json::json!({"matches": []})).into_response();
     }
-    let pages = matching_content(&state.db, "site_pages", &terms).await;
-    let articles = matching_content(&state.db, "site_articles", &terms).await;
+    let time_sensitive = ["이번", "다음", "오늘", "내일", "최신", "식단", "급식"]
+        .iter()
+        .any(|term| query_text.contains(term));
+    let pages = matching_content(&state.db, "site_pages", &terms, time_sensitive).await;
+    let articles = matching_content(&state.db, "site_articles", &terms, time_sensitive).await;
     let (Ok(pages), Ok(articles)) = (pages, articles) else {
         return message(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -861,7 +879,7 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
         );
     };
     let mut matches = Vec::new();
-    for payload in pages {
+    for (payload, date) in pages {
         let Some(menu_no) = payload.get("menu_no").and_then(serde_json::Value::as_str) else {
             continue;
         };
@@ -880,7 +898,7 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
             .unwrap_or_default();
         let excerpt = excerpt(body, &terms);
         let title_lower = title.to_lowercase();
-        let body_lower = body.to_lowercase();
+        let body_lower = html_text(body).to_lowercase();
         let score = terms
             .iter()
             .map(|term| {
@@ -894,9 +912,10 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
             url: format!("#/page/{menu_no}"),
             kind: "page",
             score,
+            date,
         });
     }
-    for payload in articles {
+    for (payload, date) in articles {
         let (Some(menu_no), Some(bno)) = (
             payload.get("menu_no").and_then(serde_json::Value::as_str),
             payload.get("bno").and_then(serde_json::Value::as_str),
@@ -913,7 +932,7 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
             .unwrap_or_default();
         let excerpt = excerpt(body, &terms);
         let title_lower = title.to_lowercase();
-        let body_lower = body.to_lowercase();
+        let body_lower = html_text(body).to_lowercase();
         let score = terms
             .iter()
             .map(|term| {
@@ -927,6 +946,7 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
             url: format!("#/page/{menu_no}?menu_no={menu_no}&bno={bno}&board_mode=view"),
             kind: "article",
             score,
+            date,
         });
     }
     if contact_intent && !matches.iter().any(|item| item.url == "#/page/20") {
@@ -950,6 +970,7 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
                 url: "#/page/20".to_owned(),
                 kind: "page",
                 score: 30,
+                date: None,
             });
         }
     }
@@ -968,13 +989,10 @@ async fn site_chat(State(state): State<AppState>, Json(input): Json<ChatRequest>
             .find(|row| row.0 == url)
             .map_or(0, |row| row.1)
     };
-    let time_sensitive = ["이번", "다음", "오늘", "내일", "최신", "식단", "급식"]
-        .iter()
-        .any(|term| query_text.contains(term));
     matches.sort_by(|left, right| {
         right.score.cmp(&left.score).then_with(|| {
             if time_sensitive {
-                std::cmp::Ordering::Equal
+                right.date.cmp(&left.date)
             } else {
                 like_count(&right.url).cmp(&like_count(&left.url))
             }
