@@ -1480,11 +1480,20 @@ async fn upload_notice_attachment(
         Ok(content_type) => content_type,
         Err(error) => return message(StatusCode::BAD_REQUEST, error),
     };
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Attachment could not be saved.",
+            );
+        }
+    };
     let payload = match sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT payload FROM notices WHERE id = $1",
+        "SELECT payload FROM notices WHERE id = $1 FOR UPDATE",
     )
     .bind(&notice_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     {
         Ok(Some(payload)) => payload,
@@ -1516,15 +1525,6 @@ async fn upload_notice_attachment(
         url: format!("/notices/{notice_id}/attachments/{attachment_id}"),
     };
     notice.attachments.push(attachment.clone());
-    let mut tx = match state.db.begin().await {
-        Ok(tx) => tx,
-        Err(_) => {
-            return message(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Attachment could not be saved.",
-            );
-        }
-    };
     if sqlx::query("INSERT INTO notice_attachments (id, notice_id, filename, content_type, size_bytes, sort_order, data) VALUES ($1, $2, $3, $4, $5, $6, $7)")
         .bind(&attachment.id)
         .bind(&notice_id)
@@ -1568,11 +1568,20 @@ async fn delete_notice_attachment(
     if let Err(response) = require_admin(&headers, &state).await {
         return response;
     }
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Attachment could not be removed.",
+            );
+        }
+    };
     let payload = match sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT payload FROM notices WHERE id = $1",
+        "SELECT payload FROM notices WHERE id = $1 FOR UPDATE",
     )
     .bind(&notice_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     {
         Ok(Some(payload)) => payload,
@@ -1595,15 +1604,6 @@ async fn delete_notice_attachment(
     if before == notice.attachments.len() {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let mut tx = match state.db.begin().await {
-        Ok(tx) => tx,
-        Err(_) => {
-            return message(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Attachment could not be removed.",
-            );
-        }
-    };
     if sqlx::query("DELETE FROM notice_attachments WHERE id = $1 AND notice_id = $2")
         .bind(&attachment_id)
         .bind(&notice_id)
@@ -1747,11 +1747,20 @@ async fn update_notice(
         Ok(image) => image,
         Err(error) => return message(StatusCode::BAD_REQUEST, error),
     };
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(_) => {
+            return message(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The request could not be saved.",
+            );
+        }
+    };
     let old_value = match sqlx::query_scalar::<_, serde_json::Value>(
-        "SELECT payload FROM notices WHERE id = $1",
+        "SELECT payload FROM notices WHERE id = $1 FOR UPDATE",
     )
     .bind(&id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await
     {
         Ok(Some(value)) => value,
@@ -1785,15 +1794,6 @@ async fn update_notice(
         published: input.published,
         created_at: old.created_at,
         updated_at: now_seconds().to_string(),
-    };
-    let mut tx = match state.db.begin().await {
-        Ok(tx) => tx,
-        Err(_) => {
-            return message(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "The request could not be saved.",
-            );
-        }
     };
     if sqlx::query("UPDATE notices SET payload = $2 WHERE id = $1")
         .bind(&id)
