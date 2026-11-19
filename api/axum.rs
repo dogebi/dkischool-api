@@ -3,8 +3,9 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Multipart, Path, Query, State},
+    extract::{Multipart, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
@@ -60,6 +61,7 @@ struct AppState {
     password_hash: Option<String>,
     secure_cookie: bool,
     same_site: String,
+    frontend_origin: Option<HeaderValue>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1043,6 +1045,46 @@ async fn import_site(
         .into_response()
 }
 
+async fn check_admin_origin(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !request.method().is_safe()
+        && let Some(origin) = &state.frontend_origin
+        && request.headers().get(header::ORIGIN) != Some(origin)
+    {
+        return message(StatusCode::FORBIDDEN, "?? ??? ??? ??? ? ????.");
+    }
+    next.run(request).await
+}
+
+async fn reserve_login_attempt(db: &PgPool, ip: &str) -> Result<bool, sqlx::Error> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(ip)
+        .execute(&mut *tx)
+        .await?;
+    let cutoff = now_seconds() - 600;
+    let attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM login_attempts WHERE ip = $1 AND attempted_at > $2",
+    )
+    .bind(ip)
+    .bind(cutoff)
+    .fetch_one(&mut *tx)
+    .await?;
+    if attempts >= 5 {
+        return Ok(false);
+    }
+    sqlx::query("INSERT INTO login_attempts (ip, attempted_at) VALUES ($1, $2)")
+        .bind(ip)
+        .bind(cutoff + 600)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 async fn login(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1066,25 +1108,19 @@ async fn login(
         .bind(now_seconds() - 600)
         .execute(&state.db)
         .await;
-    let attempts: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM login_attempts WHERE ip = $1 AND attempted_at > $2",
-    )
-    .bind(&ip)
-    .bind(now_seconds() - 600)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(0);
-    if attempts >= 5 {
-        return message(
-            StatusCode::TOO_MANY_REQUESTS,
-            "로그인 시도 횟수를 초과했습니다. 잠시 후 다시 시도해 주세요.",
-        );
+    match reserve_login_attempt(&state.db, &ip).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return message(
+                StatusCode::TOO_MANY_REQUESTS,
+                "??? ?? ??? ??????. ?? ? ?? ??? ???.",
+            );
+        }
+        Err(error) => {
+            eprintln!("Login rate limit check failed: {error}");
+            return message(StatusCode::SERVICE_UNAVAILABLE, "??? ??? ??? ? ????.");
+        }
     }
-    let _ = sqlx::query("INSERT INTO login_attempts (ip, attempted_at) VALUES ($1, $2)")
-        .bind(&ip)
-        .bind(now_seconds())
-        .execute(&state.db)
-        .await;
     let verified = PasswordHash::new(hash).ok().is_some_and(|parsed| {
         Argon2::default()
             .verify_password(input.password.as_bytes(), &parsed)
@@ -1096,10 +1132,6 @@ async fn login(
             "아이디 또는 비밀번호를 확인해 주세요.",
         );
     }
-    let _ = sqlx::query("DELETE FROM login_attempts WHERE ip = $1")
-        .bind(ip)
-        .execute(&state.db)
-        .await;
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);
     let token = URL_SAFE_NO_PAD.encode(bytes);
@@ -1730,6 +1762,10 @@ async fn app() -> Result<Router, Error> {
     {
         return Err("COOKIE_SAME_SITE=None requires COOKIE_SECURE=true; allowed values are Strict, Lax, and None".into());
     }
+    let frontend_origin = env::var("FRONTEND_ORIGIN")
+        .ok()
+        .map(|value| value.parse::<HeaderValue>())
+        .transpose()?;
     let state = AppState {
         db,
         http_client: reqwest::Client::builder()
@@ -1756,25 +1792,11 @@ async fn app() -> Result<Router, Error> {
             }),
         secure_cookie,
         same_site,
+        frontend_origin: frontend_origin.clone(),
     };
-    let mut router = Router::new()
-        .route("/api/health", get(health))
-        .route("/api/site/pages/{menu_no}", get(site_page))
-        .route("/api/site/image", get(proxy_site_image))
-        .route("/api/site/boards/{menu_no}", get(site_board))
-        .route("/api/site/articles/{menu_no}/{bno}", get(site_article))
-        .route("/api/site/chat", post(site_chat))
-        .route("/api/site/chat/popular", get(popular_chat_topics))
+    let admin = Router::new()
         .route("/api/admin/chat/stats", get(admin_chat_stats))
-        .route("/api/site/chat/feedback", post(chat_feedback))
         .route("/api/admin/site-import", post(import_site))
-        .route("/api/notices", get(list_notices))
-        .route("/api/notices/{id}", get(get_notice))
-        .route("/api/notices/{id}/image", get(notice_image))
-        .route(
-            "/api/notices/{id}/attachments/{attachment_id}",
-            get(notice_attachment),
-        )
         .route("/api/admin/login", post(login))
         .route("/api/admin/logout", post(logout))
         .route("/api/admin/session", get(admin_session))
@@ -1791,10 +1813,30 @@ async fn app() -> Result<Router, Error> {
             "/api/admin/notices/{id}/attachments/{attachment_id}",
             axum::routing::delete(delete_notice_attachment),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            check_admin_origin,
+        ));
+    let mut router = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/site/pages/{menu_no}", get(site_page))
+        .route("/api/site/image", get(proxy_site_image))
+        .route("/api/site/boards/{menu_no}", get(site_board))
+        .route("/api/site/articles/{menu_no}/{bno}", get(site_article))
+        .route("/api/site/chat", post(site_chat))
+        .route("/api/site/chat/popular", get(popular_chat_topics))
+        .route("/api/site/chat/feedback", post(chat_feedback))
+        .route("/api/notices", get(list_notices))
+        .route("/api/notices/{id}", get(get_notice))
+        .route("/api/notices/{id}/image", get(notice_image))
+        .route(
+            "/api/notices/{id}/attachments/{attachment_id}",
+            get(notice_attachment),
+        )
+        .merge(admin)
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024))
         .with_state(state);
-    if let Ok(origin) = env::var("FRONTEND_ORIGIN") {
-        let origin = origin.parse::<HeaderValue>()?;
+    if let Some(origin) = frontend_origin {
         router = router.layer(
             CorsLayer::new()
                 .allow_origin(origin)
