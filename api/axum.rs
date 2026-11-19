@@ -137,7 +137,9 @@ struct ChatMatch {
     url: String,
     kind: &'static str,
     #[serde(skip)]
-    score: usize,
+    score: i32,
+    #[serde(skip)]
+    likes: i64,
     #[serde(skip)]
     date: Option<String>,
 }
@@ -632,21 +634,15 @@ async fn matching_content(
     table: &'static str,
     terms: &[String],
     time_sensitive: bool,
-) -> Result<Vec<(serde_json::Value, Option<String>)>, sqlx::Error> {
-    let mut query = QueryBuilder::<Postgres>::new(format!(
-        "SELECT payload, {SEARCH_DATE} FROM {table} WHERE ("
-    ));
-    for (index, term) in terms.iter().enumerate() {
-        if index > 0 {
-            query.push(" OR ");
-        }
-        query
-            .push("(coalesce(payload->>'title', '') || ' ' || school_search_body(payload)) ILIKE ")
-            .push_bind(format!("%{term}%"));
-    }
-    query.push(")");
-    query.push(" AND ").push(PUBLIC_CONTENT);
-    query.push(" ORDER BY (");
+    question_key: &str,
+) -> Result<Vec<(serde_json::Value, Option<String>, i32, i64)>, sqlx::Error> {
+    let url = if table == "site_pages" {
+        "'#/page/' || menu_no"
+    } else {
+        "'#/page/' || menu_no || '?menu_no=' || menu_no || '&bno=' || bno || '&board_mode=view'"
+    };
+    let mut query =
+        QueryBuilder::<Postgres>::new(format!("SELECT payload, {SEARCH_DATE} AS published_date, "));
     for (index, term) in terms.iter().enumerate() {
         if index > 0 {
             query.push(" + ");
@@ -658,17 +654,36 @@ async fn matching_content(
             .push_bind(format!("%{term}%"))
             .push(" THEN 1 ELSE 0 END");
     }
-    query.push(") DESC");
+    query.push(" AS score, ");
     if time_sensitive {
-        query.push(", 2 DESC NULLS LAST");
+        query.push("0::bigint");
+    } else {
+        query
+            .push("(SELECT count(*) FROM chat_likes WHERE question_key = ")
+            .push_bind(question_key)
+            .push(format!(" AND result_url = ({url}))"));
     }
-    query.push(", menu_no");
-    if table == "site_articles" {
-        query.push(", bno");
+    query.push(format!(" AS likes FROM {table} WHERE ("));
+    for (index, term) in terms.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query
+            .push("(coalesce(payload->>'title', '') || ' ' || school_search_body(payload)) ILIKE ")
+            .push_bind(format!("%{term}%"));
     }
     query
-        .push(" LIMIT 8")
-        .build_query_as::<(serde_json::Value, Option<String>)>()
+        .push(") AND ")
+        .push(PUBLIC_CONTENT)
+        .push(" ORDER BY score DESC, ");
+    query.push(if time_sensitive {
+        "published_date DESC NULLS LAST, "
+    } else {
+        "likes DESC, "
+    });
+    query
+        .push(format!(r#"({url}) COLLATE "C" LIMIT 8"#))
+        .build_query_as::<(serde_json::Value, Option<String>, i32, i64)>()
         .fetch_all(db)
         .await
 }
@@ -930,8 +945,23 @@ async fn site_chat(
     let time_sensitive = ["이번", "다음", "오늘", "내일", "최신", "식단", "급식"]
         .iter()
         .any(|term| query_text.contains(term));
-    let pages = matching_content(&state.db, "site_pages", &terms, time_sensitive).await;
-    let articles = matching_content(&state.db, "site_articles", &terms, time_sensitive).await;
+    let question_key = chat_question_key(query_text);
+    let pages = matching_content(
+        &state.db,
+        "site_pages",
+        &terms,
+        time_sensitive,
+        &question_key,
+    )
+    .await;
+    let articles = matching_content(
+        &state.db,
+        "site_articles",
+        &terms,
+        time_sensitive,
+        &question_key,
+    )
+    .await;
     let (Ok(pages), Ok(articles)) = (pages, articles) else {
         return message(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -939,7 +969,7 @@ async fn site_chat(
         );
     };
     let mut matches = Vec::new();
-    for (payload, date) in pages {
+    for (payload, date, score, likes) in pages {
         let Some(menu_no) = payload.get("menu_no").and_then(serde_json::Value::as_str) else {
             continue;
         };
@@ -957,25 +987,17 @@ async fn site_chat(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         let excerpt = excerpt(body, &terms);
-        let title_lower = title.to_lowercase();
-        let body_lower = html_text(body).to_lowercase();
-        let score = terms
-            .iter()
-            .map(|term| {
-                usize::from(title_lower.contains(&term.to_lowercase())) * 10
-                    + usize::from(body_lower.contains(&term.to_lowercase()))
-            })
-            .sum();
         matches.push(ChatMatch {
             title: title.to_owned(),
             excerpt,
             url: format!("#/page/{menu_no}"),
             kind: "page",
             score,
+            likes,
             date,
         });
     }
-    for (payload, date) in articles {
+    for (payload, date, score, likes) in articles {
         let (Some(menu_no), Some(bno)) = (
             payload.get("menu_no").and_then(serde_json::Value::as_str),
             payload.get("bno").and_then(serde_json::Value::as_str),
@@ -991,21 +1013,13 @@ async fn site_chat(
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         let excerpt = excerpt(body, &terms);
-        let title_lower = title.to_lowercase();
-        let body_lower = html_text(body).to_lowercase();
-        let score = terms
-            .iter()
-            .map(|term| {
-                usize::from(title_lower.contains(&term.to_lowercase())) * 10
-                    + usize::from(body_lower.contains(&term.to_lowercase()))
-            })
-            .sum();
         matches.push(ChatMatch {
             title: title.to_owned(),
             excerpt,
             url: format!("#/page/{menu_no}?menu_no={menu_no}&bno={bno}&board_mode=view"),
             kind: "article",
             score,
+            likes,
             date,
         });
     }
@@ -1030,6 +1044,7 @@ async fn site_chat(
                 url: "#/page/20".to_owned(),
                 kind: "page",
                 score: 30,
+                likes: 0,
                 date: None,
             });
         }
@@ -1041,26 +1056,24 @@ async fn site_chat(
         }
     }
     let visitor = input.visitor.filter(|id| Uuid::parse_str(id).is_ok());
-    let urls: Vec<_> = matches.iter().map(|item| item.url.clone()).collect();
-    let reactions = sqlx::query_as::<_, (String, i64, bool)>(
-        "SELECT result_url, COUNT(*), BOOL_OR(visitor = $3::text::uuid) IS TRUE FROM chat_likes WHERE question_key = $1 AND result_url = ANY($2) GROUP BY result_url"
-    ).bind(chat_question_key(query_text)).bind(&urls).bind(&visitor).fetch_all(&state.db).await.unwrap_or_default();
-    let like_count = |url: &str| {
-        reactions
-            .iter()
-            .find(|row| row.0 == url)
-            .map_or(0, |row| row.1)
-    };
     matches.sort_by(|left, right| {
-        right.score.cmp(&left.score).then_with(|| {
-            if time_sensitive {
-                right.date.cmp(&left.date)
-            } else {
-                like_count(&right.url).cmp(&like_count(&left.url))
-            }
-        })
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| {
+                if time_sensitive {
+                    right.date.cmp(&left.date)
+                } else {
+                    right.likes.cmp(&left.likes)
+                }
+            })
+            .then_with(|| left.url.cmp(&right.url))
     });
     matches.truncate(8);
+    let urls: Vec<_> = matches.iter().map(|item| item.url.as_str()).collect();
+    let liked = sqlx::query_scalar::<_, String>(
+        "SELECT result_url FROM chat_likes WHERE question_key = $1 AND result_url = ANY($2) AND visitor = $3::text::uuid"
+    ).bind(&question_key).bind(&urls).bind(&visitor).fetch_all(&state.db).await.unwrap_or_default();
     if let Some(visitor) = visitor {
         let urls: Vec<_> = matches.iter().map(|item| item.url.as_str()).collect();
         if let Err(error) = sqlx::query(
@@ -1079,11 +1092,6 @@ async fn site_chat(
             eprintln!("Chat search receipt write failed: {error}");
         }
     }
-    let liked: Vec<_> = reactions
-        .iter()
-        .filter(|row| row.2)
-        .map(|row| &row.0)
-        .collect();
     Json(serde_json::json!({"matches": matches, "liked": liked})).into_response()
 }
 
