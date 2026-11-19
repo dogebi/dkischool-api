@@ -359,50 +359,21 @@ async fn initialize_db(db: &PgPool) -> Result<(), Error> {
         .bind(now_seconds())
         .execute(db)
         .await?;
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notices")
-        .fetch_one(db)
-        .await?;
-    if count == 0 {
-        let now = now_seconds().to_string();
-        for (category, title, body) in [
-            (
-                "공지사항",
-                "학교 교육활동 안내",
-                "학교 교육활동 안내 예시입니다.",
-            ),
-            (
-                "공지사항",
-                "신입생 입학 안내",
-                "입학 안내 예시입니다. 실제 일정은 학교 공식 홈페이지에서 확인하세요.",
-            ),
-            (
-                "가정통신문",
-                "안전 및 건강 관리 안내",
-                "가정통신문 예시입니다.",
-            ),
-        ] {
-            let notice = Notice {
-                id: Uuid::new_v4().to_string(),
-                category: category.into(),
-                menu_id: None,
-                image_url: None,
-                attachments: Vec::new(),
-                title: title.into(),
-                body: body.into(),
-                published: true,
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            };
-            let id = notice.id.clone();
-            sqlx::query("INSERT INTO notices (id, created_at, payload) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-                .bind(id).bind(now.parse::<i64>().unwrap_or_default()).bind(serde_json::to_value(notice).unwrap_or_default()).execute(db).await?;
-        }
-    }
     Ok(())
 }
 
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok", "service":"dkischool-api"}))
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    match sqlx::query("SELECT 1").execute(&state.db).await {
+        Ok(_) => Json(serde_json::json!({"status": "ready"})).into_response(),
+        Err(error) => {
+            eprintln!("Database readiness check failed: {error}");
+            message(StatusCode::SERVICE_UNAVAILABLE, "Database unavailable")
+        }
+    }
 }
 
 async fn site_page(State(state): State<AppState>, Path(menu_no): Path<String>) -> Response {
@@ -836,12 +807,15 @@ async fn chat_request_limit(
     .await;
     match count {
         Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(message(StatusCode::TOO_MANY_REQUESTS, "?? ? ?? ??? ???.")),
+        Ok(None) => Err(message(
+            StatusCode::TOO_MANY_REQUESTS,
+            "잠시 후 다시 시도해 주세요.",
+        )),
         Err(error) => {
             eprintln!("Chat request limit check failed: {error}");
             Err(message(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "?? ??? ??? ??? ? ????.",
+                "검색 서비스 상태를 확인할 수 없습니다.",
             ))
         }
     }
@@ -880,10 +854,18 @@ async fn chat_feedback(
         .await;
         match issued {
             Ok(true) => {}
-            Ok(false) => return message(StatusCode::BAD_REQUEST, "??? ?? ??? ? ??? ?? ???."),
+            Ok(false) => {
+                return message(
+                    StatusCode::BAD_REQUEST,
+                    "검색을 다시 실행한 뒤 반응을 남겨 주세요.",
+                );
+            }
             Err(error) => {
                 eprintln!("Chat search receipt lookup failed: {error}");
-                return message(StatusCode::SERVICE_UNAVAILABLE, "?? ??? ??? ? ????.");
+                return message(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "검색 결과를 확인할 수 없습니다.",
+                );
             }
         }
     }
@@ -1168,7 +1150,10 @@ async fn check_admin_origin(
         && let Some(origin) = &state.frontend_origin
         && request.headers().get(header::ORIGIN) != Some(origin)
     {
-        return message(StatusCode::FORBIDDEN, "?? ??? ??? ??? ? ????.");
+        return message(
+            StatusCode::FORBIDDEN,
+            "관리 요청의 출처를 확인할 수 없습니다.",
+        );
     }
     next.run(request).await
 }
@@ -1231,12 +1216,15 @@ async fn login(
         Ok(false) => {
             return message(
                 StatusCode::TOO_MANY_REQUESTS,
-                "??? ?? ??? ??????. ?? ? ?? ??? ???.",
+                "로그인 시도 횟수를 초과했습니다. 잠시 후 다시 시도해 주세요.",
             );
         }
         Err(error) => {
             eprintln!("Login rate limit check failed: {error}");
-            return message(StatusCode::SERVICE_UNAVAILABLE, "??? ??? ??? ? ????.");
+            return message(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "로그인 상태를 확인할 수 없습니다.",
+            );
         }
     }
     let verified = PasswordHash::new(hash).ok().is_some_and(|parsed| {
@@ -1937,6 +1925,7 @@ async fn app() -> Result<Router, Error> {
         ));
     let mut router = Router::new()
         .route("/api/health", get(health))
+        .route("/api/ready", get(readiness))
         .route("/api/site/pages/{menu_no}", get(site_page))
         .route("/api/site/image", get(proxy_site_image))
         .route("/api/site/boards/{menu_no}", get(site_board))
@@ -1981,6 +1970,305 @@ mod tests {
         normalized_search_terms, safe_attachment_filename, validate_attachment, validate_notice,
     };
     use base64::Engine;
+
+    // Run against an empty, disposable PostgreSQL database.
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database and test configuration"]
+    async fn postgres_http_regressions() {
+        use super::*;
+        use serde_json::json;
+        use tower::ServiceExt;
+
+        let db = PgPool::connect(&env::var("DATABASE_URL").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass('public.notices')::text")
+                .fetch_one(&db)
+                .await
+                .unwrap()
+                .is_none(),
+            "use an empty, disposable test database"
+        );
+
+        let legacy = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(MIGRATOR.iter().take(5).cloned().collect()),
+            ..sqlx::migrate::Migrator::DEFAULT
+        };
+        if env::var("DKIS_TEST_UPGRADE").as_deref() == Ok("1") {
+            legacy.run(&db).await.unwrap();
+            sqlx::query("INSERT INTO site_pages VALUES ('10', 'Legacy', $1)")
+                .bind(json!({"menu_no":"10","title":"Legacy","body_html":"imported"}))
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        let router = app().await.unwrap();
+        let request = |method: &str,
+                       path: &str,
+                       origin: &str,
+                       cookie: &str,
+                       content_type: &str,
+                       body: Body| {
+            router.clone().oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::ORIGIN, origin)
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, content_type)
+                    .body(body)
+                    .unwrap(),
+            )
+        };
+        let origin = env::var("FRONTEND_ORIGIN").unwrap();
+        let json_type = "application/json";
+        assert_eq!(
+            request("GET", "/api/ready", &origin, "", json_type, Body::empty())
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        if env::var("DKIS_TEST_UPGRADE").as_deref() == Ok("1") {
+            assert_eq!(
+                request(
+                    "GET",
+                    "/api/site/pages/10",
+                    &origin,
+                    "",
+                    json_type,
+                    Body::empty()
+                )
+                .await
+                .unwrap()
+                .status(),
+                200
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM notices")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        for page in [
+            json!({"menu_no":"20","title":"연락처","body_html":"숨김","access_status":"restricted"}),
+            json!({"menu_no":"21","title":"학교","body_html":"<a href='전화번호'>학교</a>"}),
+        ] {
+            sqlx::query("INSERT INTO site_pages VALUES ($1, $2, $3)")
+                .bind(page["menu_no"].as_str())
+                .bind(page["title"].as_str())
+                .bind(&page)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        for (bno, date) in [("1", "2025.01.01"), ("2", "2026-01-01")] {
+            sqlx::query("INSERT INTO site_articles VALUES ('47', $1, 0, $2)")
+                .bind(bno)
+                .bind(json!({"menu_no":"47","bno":bno,"title":"최신 공지","metadata_text":date}))
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            request(
+                "GET",
+                "/api/site/pages/20",
+                &origin,
+                "",
+                json_type,
+                Body::empty()
+            )
+            .await
+            .unwrap()
+            .status(),
+            404
+        );
+        let visitor = Uuid::new_v4().to_string();
+        for (question, count) in [("전화번호", 0), ("최신 공지", 2)] {
+            let response = request(
+                "POST",
+                "/api/site/chat",
+                &origin,
+                "",
+                json_type,
+                Body::from(json!({"message": question, "visitor": visitor}).to_string()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), 200);
+            let bytes = axum::body::to_bytes(response.into_body(), 32768)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["matches"].as_array().unwrap().len(), count);
+            if count > 0 {
+                assert!(
+                    json["matches"][0]["url"]
+                        .as_str()
+                        .unwrap()
+                        .contains("bno=2")
+                );
+                for (url, expected) in [
+                    (json["matches"][0]["url"].as_str().unwrap(), 204),
+                    ("#/page/99", 400),
+                ] {
+                    assert_eq!(request("POST", "/api/site/chat/feedback", &origin, "", json_type,
+                        Body::from(json!({"message":question,"visitor":visitor,"url":url,"liked":true}).to_string()))
+                        .await.unwrap().status(), expected);
+                }
+            }
+        }
+
+        let headers = HeaderMap::new();
+        assert!(chat_request_limit(&db, &headers, "test", 1).await.is_ok());
+        assert_eq!(
+            chat_request_limit(&db, &headers, "test", 1)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+
+        let mut attempts = tokio::task::JoinSet::new();
+        for _ in 0..10 {
+            let db = db.clone();
+            attempts.spawn(async move { reserve_login_attempt(&db, "192.0.2.1").await.unwrap() });
+        }
+        let mut admitted = 0;
+        while let Some(result) = attempts.join_next().await {
+            admitted += usize::from(result.unwrap());
+        }
+        assert_eq!(admitted, 5);
+
+        let login = json!({"username":env::var("ADMIN_USERNAME").unwrap(),"password":env::var("ADMIN_PASSWORD").unwrap()});
+        assert_eq!(
+            request(
+                "POST",
+                "/api/admin/login",
+                "https://invalid.example",
+                "",
+                json_type,
+                Body::from(login.to_string())
+            )
+            .await
+            .unwrap()
+            .status(),
+            403
+        );
+        let response = request(
+            "POST",
+            "/api/admin/login",
+            &origin,
+            "",
+            json_type,
+            Body::from(login.to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let draft = json!({"category":"공지사항","title":"Test","body":"Draft","published":false});
+        let response = request(
+            "POST",
+            "/api/admin/notices",
+            &origin,
+            &cookie,
+            json_type,
+            Body::from(draft.to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+        let id: String = sqlx::query_scalar("SELECT id FROM notices")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let multipart = b"--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"test.pdf\"\r\n\r\n%PDF-1.7\r\n--test--\r\n";
+        let response = request(
+            "POST",
+            &format!("/api/admin/notices/{id}/attachments"),
+            &origin,
+            &cookie,
+            "multipart/form-data; boundary=test",
+            Body::from(multipart.as_slice()),
+        )
+        .await
+        .unwrap();
+        assert!(response.status().is_success());
+        let attachment: String = sqlx::query_scalar("SELECT id FROM notice_attachments")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let path = format!("/api/notices/{id}/attachments/{attachment}");
+        assert_eq!(
+            request("GET", &path, &origin, "", json_type, Body::empty())
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+        assert_eq!(
+            request("GET", &path, &origin, &cookie, json_type, Body::empty())
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        let mut published = draft;
+        published["published"] = json!(true);
+        assert!(
+            request(
+                "PUT",
+                &format!("/api/admin/notices/{id}"),
+                &origin,
+                &cookie,
+                json_type,
+                Body::from(published.to_string())
+            )
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+        );
+        assert_eq!(
+            request("GET", &path, &origin, "", json_type, Body::empty())
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert!(
+            request(
+                "DELETE",
+                &format!("/api/admin/notices/{id}/attachments/{attachment}"),
+                &origin,
+                &cookie,
+                json_type,
+                Body::empty()
+            )
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+        );
+        assert_eq!(
+            request("GET", &path, &origin, "", json_type, Body::empty())
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+    }
 
     fn valid_notice(menu_id: Option<&str>) -> NoticeInput {
         NoticeInput {
