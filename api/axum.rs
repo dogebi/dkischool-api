@@ -1355,15 +1355,23 @@ async fn get_notice(State(state): State<AppState>, Path(id): Path<String>) -> Re
     }
 }
 
-async fn notice_image(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match sqlx::query_as::<_, (String, Vec<u8>)>(
-        "SELECT content_type, data FROM notice_images WHERE notice_id = $1",
+async fn notice_image(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    match sqlx::query_as::<_, (bool, String, Vec<u8>)>(
+        "SELECT (n.payload->'published' = 'true'::jsonb) IS TRUE, i.content_type, i.data
+         FROM notice_images i JOIN notices n ON n.id = i.notice_id WHERE i.notice_id = $1",
     )
     .bind(id)
     .fetch_optional(&state.db)
     .await
     {
-        Ok(Some((content_type, bytes))) => {
+        Ok(Some((published, content_type, bytes))) => {
+            if !published && session_user(&headers, &state).await.is_none() {
+                return StatusCode::NOT_FOUND.into_response();
+            }
             let mut response = Body::from(bytes).into_response();
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -1372,7 +1380,7 @@ async fn notice_image(State(state): State<AppState>, Path(id): Path<String>) -> 
             );
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=3600"),
+                HeaderValue::from_static("private, no-store"),
             );
             response.headers_mut().insert(
                 "x-content-type-options",
@@ -1426,11 +1434,7 @@ async fn notice_attachment(
             }
             response.headers_mut().insert(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static(if published {
-                    "public, max-age=3600"
-                } else {
-                    "private, no-store"
-                }),
+                HeaderValue::from_static("private, no-store"),
             );
             response.headers_mut().insert(
                 "x-content-type-options",
