@@ -20,6 +20,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder, postgres::PgPoolOptions};
 use std::{
     collections::HashMap,
     env,
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceBuilder;
@@ -62,6 +63,7 @@ struct AppState {
     secure_cookie: bool,
     same_site: String,
     frontend_origin: Option<HeaderValue>,
+    password_workers: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1211,6 +1213,9 @@ async fn login(
         .bind(now_seconds() - 600)
         .execute(&state.db)
         .await;
+    let Ok(permit) = state.password_workers.clone().try_acquire_owned() else {
+        return message(StatusCode::SERVICE_UNAVAILABLE, "Login service is busy");
+    };
     match reserve_login_attempt(&state.db, ip).await {
         Ok(true) => {}
         Ok(false) => {
@@ -1227,11 +1232,23 @@ async fn login(
             );
         }
     }
-    let verified = PasswordHash::new(hash).ok().is_some_and(|parsed| {
-        Argon2::default()
-            .verify_password(input.password.as_bytes(), &parsed)
-            .is_ok()
-    });
+    let hash = hash.clone();
+    let password = input.password;
+    let verified = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        PasswordHash::new(&hash).ok().is_some_and(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        })
+    })
+    .await;
+    let Ok(verified) = verified else {
+        return message(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Password verification failed",
+        );
+    };
     if input.username != *username || !verified {
         return message(
             StatusCode::UNAUTHORIZED,
@@ -1876,6 +1893,16 @@ async fn app() -> Result<Router, Error> {
         .ok()
         .map(|value| value.parse::<HeaderValue>())
         .transpose()?;
+    let username = env::var("ADMIN_USERNAME")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let password = env::var("ADMIN_PASSWORD")
+        .ok()
+        .filter(|value| value.chars().count() >= 12);
+    if same_site == "None" && username.is_some() && password.is_some() && frontend_origin.is_none()
+    {
+        return Err("FRONTEND_ORIGIN is required for cross-site administrator cookies".into());
+    }
     let state = AppState {
         db,
         http_client: reqwest::Client::builder()
@@ -1888,21 +1915,19 @@ async fn app() -> Result<Router, Error> {
                 }
             }))
             .build()?,
-        username: env::var("ADMIN_USERNAME").ok().filter(|v| !v.is_empty()),
-        password_hash: env::var("ADMIN_PASSWORD")
-            .ok()
-            .filter(|v| v.chars().count() >= 12)
-            .map(|password| {
-                use argon2::PasswordHasher;
-                use argon2::password_hash::SaltString;
-                Argon2::default()
-                    .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
-                    .map(|h| h.to_string())
-                    .unwrap_or_default()
-            }),
+        username,
+        password_hash: password.map(|password| {
+            use argon2::PasswordHasher;
+            use argon2::password_hash::SaltString;
+            Argon2::default()
+                .hash_password(password.as_bytes(), &SaltString::generate(&mut OsRng))
+                .map(|h| h.to_string())
+                .unwrap_or_default()
+        }),
         secure_cookie,
         same_site,
         frontend_origin: frontend_origin.clone(),
+        password_workers: Arc::new(tokio::sync::Semaphore::new(2)),
     };
     let admin = Router::new()
         .route("/api/admin/chat/stats", get(admin_chat_stats))
