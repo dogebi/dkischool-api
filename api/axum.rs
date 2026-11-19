@@ -1,7 +1,7 @@
 // GitHub Pages 학교 홈페이지용 Axum 관리자 API 서버리스 진입점
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Body,
     extract::{Multipart, Path, Query, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
@@ -195,19 +195,25 @@ async fn session_user(headers: &HeaderMap, state: &AppState) -> Option<String> {
     .flatten()
 }
 
-async fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<String, Box<Response>> {
+#[derive(Clone)]
+struct AdminUser(String);
+
+async fn require_admin(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     if state.username.is_none() || state.password_hash.is_none() {
-        return Err(Box::new(message(
+        return message(
             StatusCode::SERVICE_UNAVAILABLE,
             "서버에 관리자 계정이 설정되지 않았습니다.",
-        )));
+        );
     }
-    session_user(headers, state).await.ok_or_else(|| {
-        Box::new(message(
-            StatusCode::UNAUTHORIZED,
-            "관리자 로그인이 필요합니다.",
-        ))
-    })
+    let Some(username) = session_user(request.headers(), &state).await else {
+        return message(StatusCode::UNAUTHORIZED, "관리자 로그인이 필요합니다.");
+    };
+    request.extensions_mut().insert(AdminUser(username));
+    next.run(request).await
 }
 
 fn set_session_cookie(response: &mut Response, token: &str, state: &AppState) {
@@ -736,12 +742,8 @@ fn chat_topic(question: &str) -> Option<&'static str> {
 
 async fn admin_chat_stats(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(response) = require_admin(&headers, &state).await {
-        return *response;
-    }
     let days = match query.get("days").map(String::as_str).unwrap_or("30") {
         "7" => 7,
         "30" => 30,
@@ -1097,14 +1099,7 @@ async fn site_chat(
     Json(serde_json::json!({"matches": matches, "liked": liked})).into_response()
 }
 
-async fn import_site(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<SiteImport>,
-) -> Response {
-    if let Err(response) = require_admin(&headers, &state).await {
-        return *response;
-    }
+async fn import_site(State(state): State<AppState>, Json(input): Json<SiteImport>) -> Response {
     if input.pages.len() + input.articles.len() > 20 {
         return message(
             StatusCode::BAD_REQUEST,
@@ -1307,17 +1302,8 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     response
 }
 
-async fn admin_session(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match session_user(&headers, &state).await {
-        Some(username) => {
-            Json(serde_json::json!({"authenticated":true,"username":username})).into_response()
-        }
-        None if state.username.is_none() || state.password_hash.is_none() => message(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "서버에 관리자 계정이 설정되지 않았습니다.",
-        ),
-        None => message(StatusCode::UNAUTHORIZED, "관리자 로그인이 필요합니다."),
-    }
+async fn admin_session(Extension(AdminUser(username)): Extension<AdminUser>) -> Response {
+    Json(serde_json::json!({"authenticated":true,"username":username})).into_response()
 }
 
 async fn read_notices(db: &PgPool) -> Result<Vec<Notice>, sqlx::Error> {
@@ -1497,12 +1483,8 @@ async fn notice_attachment(
 async fn upload_notice_attachment(
     State(state): State<AppState>,
     Path(notice_id): Path<String>,
-    headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    if let Err(response) = require_admin(&headers, &state).await {
-        return *response;
-    }
     let field = match multipart.next_field().await {
         Ok(Some(field)) if field.name() == Some("file") => field,
         _ => return message(StatusCode::BAD_REQUEST, "A file field is required."),
@@ -1611,11 +1593,7 @@ async fn upload_notice_attachment(
 async fn delete_notice_attachment(
     State(state): State<AppState>,
     Path((notice_id, attachment_id)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Response {
-    if let Err(response) = require_admin(&headers, &state).await {
-        return *response;
-    }
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
         Err(_) => {
@@ -1679,10 +1657,7 @@ async fn delete_notice_attachment(
     }
 }
 
-async fn admin_notices(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(response) = require_admin(&headers, &state).await {
-        return *response;
-    }
+async fn admin_notices(State(state): State<AppState>) -> Response {
     match read_notices(&state.db).await {
         Ok(notices) => Json(notices).into_response(),
         Err(_) => message(
@@ -1692,14 +1667,7 @@ async fn admin_notices(State(state): State<AppState>, headers: HeaderMap) -> Res
     }
 }
 
-async fn create_notice(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<NoticeInput>,
-) -> Response {
-    if let Err(response) = require_admin(&headers, &state).await {
-        return *response;
-    }
+async fn create_notice(State(state): State<AppState>, Json(input): Json<NoticeInput>) -> Response {
     if let Err(error) = validate_notice(&input) {
         return message(StatusCode::BAD_REQUEST, error);
     }
@@ -1775,13 +1743,9 @@ async fn create_notice(
 
 async fn update_notice(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Path(id): Path<String>,
     Json(input): Json<NoticeInput>,
 ) -> Response {
-    if let Err(response) = require_admin(&headers, &state).await {
-        return *response;
-    }
     if let Err(error) = validate_notice(&input) {
         return message(StatusCode::BAD_REQUEST, error);
     }
@@ -1880,14 +1844,7 @@ async fn update_notice(
     Json(notice).into_response()
 }
 
-async fn delete_notice(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Response {
-    if let Err(response) = require_admin(&headers, &state).await {
-        return *response;
-    }
+async fn delete_notice(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match sqlx::query("DELETE FROM notices WHERE id = $1")
         .bind(id)
         .execute(&state.db)
@@ -1964,8 +1921,6 @@ async fn app() -> Result<Router, Error> {
     let admin = Router::new()
         .route("/api/admin/chat/stats", get(admin_chat_stats))
         .route("/api/admin/site-import", post(import_site))
-        .route("/api/admin/login", post(login))
-        .route("/api/admin/logout", post(logout))
         .route("/api/admin/session", get(admin_session))
         .route("/api/admin/notices", get(admin_notices).post(create_notice))
         .route(
@@ -1980,6 +1935,9 @@ async fn app() -> Result<Router, Error> {
             "/api/admin/notices/{id}/attachments/{attachment_id}",
             axum::routing::delete(delete_notice_attachment),
         )
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
+        .route("/api/admin/login", post(login))
+        .route("/api/admin/logout", post(logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             check_admin_origin,
@@ -2239,6 +2197,41 @@ mod tests {
             admitted += usize::from(result.unwrap());
         }
         assert_eq!(admitted, 5);
+
+        for (method, path) in [
+            ("GET", "/api/admin/chat/stats"),
+            ("GET", "/api/admin/session"),
+            ("GET", "/api/admin/notices"),
+            ("POST", "/api/admin/notices"),
+            ("PUT", "/api/admin/notices/test"),
+            ("DELETE", "/api/admin/notices/test"),
+            ("POST", "/api/admin/notices/test/attachments"),
+            ("DELETE", "/api/admin/notices/test/attachments/file"),
+            ("POST", "/api/admin/site-import"),
+        ] {
+            let response = request(method, path, &origin, "", json_type, Body::empty())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+        assert_eq!(
+            request(
+                "POST",
+                "/api/admin/logout",
+                &origin,
+                "",
+                json_type,
+                Body::empty()
+            )
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::OK
+        );
 
         let login = json!({"username":env::var("ADMIN_USERNAME").unwrap(),"password":env::var("ADMIN_PASSWORD").unwrap()});
         assert_eq!(
